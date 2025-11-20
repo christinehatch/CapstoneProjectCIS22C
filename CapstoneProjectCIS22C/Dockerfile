@@ -12,7 +12,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Copy the C++ source file into the image
-COPY main.cpp .
+COPY main.cpp /app/main.cpp
 
 # Copy the data files into the same directory where the server will run.
 # This is important so loadAirports("airports.dat") etc. work.
