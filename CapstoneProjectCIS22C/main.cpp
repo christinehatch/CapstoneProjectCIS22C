@@ -1739,14 +1739,7 @@ int main() {
                     codeTab.classList.remove("active");
                 }
             }
-        function getAirlineLogoUrl(code) {
-                    if (!code || code === "\\N") {
-                        // Simple placeholder for unknown codes
-                        return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
-                    }
-                    // Kiwi pattern for airline logos by IATA code
-                    return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
-                }
+        
             // STUDENT tab: toggle open/closed
             studentTab.addEventListener("click", () => {
                 if (studentOpen) {
@@ -2879,34 +2872,34 @@ int main() {
             }
             // --- Airline logo helpers ---
             function getAirlineLogoUrl(code) {
-                        if (!code || code === "\\N") {
-                            // Simple placeholder for unknown codes
-                            return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
-                        }
-                        // Kiwi pattern for airline logos by IATA code
-                        return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
-                    }
+              if (!code || code === "\\N") {
+                // simple placeholder if unknown
+                return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
+              }
+              // Kiwi pattern for airline logos by IATA code
+              return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
+            }
 
-                        function createAirlinePill(airlineObj) {
-                            const name  = airlineObj.name || airlineObj.code || "Unknown airline";
-                            const code  = airlineObj.iata || airlineObj.icao || airlineObj.code || "";
-                            const label = code ? (name + " (" + code + ")") : name;
-                    
-                            const pill = document.createElement("span");
-                            pill.className = "airline-pill";
-                    
-                            const logo = document.createElement("img");
-                            logo.src = getAirlineLogoUrl(airlineObj.iata || airlineObj.icao || "");
-                            logo.alt = label + " logo";
-                            logo.onerror = function () {
-                                // Hide logo if the image 404s
-                                this.style.display = "none";
-                            };
-                    
-                            pill.appendChild(logo);
-                            pill.appendChild(document.createTextNode(label));
-                            return pill;
-                        }
+            function createAirlinePill(airlineObj) {
+              const code = airlineObj.iata || airlineObj.icao || airlineObj.code || "";
+              const name = airlineObj.name || (code ? code : "Unknown airline");
+              const label = code ? (name + " (" + code + ")") : name;
+
+              const pill = document.createElement("span");
+              pill.className = "airline-pill";
+
+              const logo = document.createElement("img");
+              logo.src = getAirlineLogoUrl(code);
+              logo.alt = label + " logo";
+              logo.onerror = function () {
+                // hide the broken image if logo is missing
+                this.style.display = "none";
+              };
+
+              pill.appendChild(logo);
+              pill.appendChild(document.createTextNode(label));
+              return pill;
+            }
         
               function setError(msg) {
                 errorEl.textContent = msg || "";
@@ -3128,7 +3121,7 @@ int main() {
             response = buildHttpResponse(body, "text/html; charset=UTF-8");
         }
         
-        else if (path == "/airport-ui" || path == "/airport-ui/") {
+        else if (pathOnly == "/airport-ui" || pathOnly == "/airport-ui/") {
             std::string body = R"HTML(
             <!DOCTYPE html>
             <html lang="en">
@@ -3500,14 +3493,13 @@ int main() {
                   
             // --- Airline logo + pill helpers (same behavior as airline-ui) ---
             function getAirlineLogoUrl(code) {
-                        if (!code || code === "\\N") {
-                            // Simple placeholder for unknown codes
-                            return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
-                        }
-                        // Kiwi pattern for airline logos by IATA code
-                        return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
-                    }
-            
+              if (!code || code === "\\N") {
+                // simple placeholder if unknown
+                return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
+              }
+              // Kiwi pattern for airline logos by IATA code
+              return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
+            }
 
             function airlineDisplayName(al) {
               if (!al) return "Unknown airline";
@@ -3516,22 +3508,21 @@ int main() {
               return code ? base + " (" + code + ")" : base;
             }
 
-            // Now uses the exact structure of the .airline-pill CSS
-            function createAirlinePillHtml(alObj) {
-                const al   = alObj.airline || alObj || {};
-                const code = al.iata || al.icao || al.code || "";
-                const name = airlineDisplayName(al);
-                const logoUrl = getAirlineLogoUrl(code);
+            function renderAirlinePillFromData(entry) {
+              const al   = entry.airline || {};
+              const code = al.iata || al.icao || al.code || "";
+              const name = airlineDisplayName(al);
 
-                // This HTML structure matches the CSS defined for .airline-pill
-                // It embeds an image that will use the Kiwi URL or the placeholder
+              const logoUrl = code ? getAirlineLogoUrl(code) : "";
+
+              if (logoUrl) {
                 return (
-                    '<span class="airline-pill">' +
-                      '<img src="' + logoUrl + '" alt="' + name + ' logo" onerror="this.style.display=\'none\'" />' +
-                      '<span class="airline-pill-name">' + name + '</span>' +
-                    '</span>'
+                  '<span class="airline-pill">' +
+                    '<img class="airline-pill-logo" src="' + logoUrl + '" alt="' + code + ' logo" />' +
+                    '<span class="airline-pill-name">' + name + "</span>" +
+                  "</span>"
                 );
-            }
+              }
 
               const initial = (name || code || "?").charAt(0).toUpperCase();
               return (
@@ -3591,7 +3582,7 @@ int main() {
                       card.className = "route-card";
                       card.innerHTML =
                         '<div class="route-main-line">' +
-                          createAirlinePillHtml(entry) +
+                          renderAirlinePillFromData(entry) +
                           '<span class="route-tag">' + count + ' route' + (count === 1 ? "" : "s") + "</span>" +
                         "</div>" +
                         '<div class="route-sub-line">' +

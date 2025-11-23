@@ -1,0 +1,50 @@
+# -------------------------
+# macOS system files
+# -------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# -------------------------
+# Xcode / C++ build files
+# -------------------------
+build/
+DerivedData/
+*.xcuserdata/
+*.xcuserstate
+*.xcodeproj/project.xcworkspace/xcuserdata
+*.xcodeproj/xcuserdata
+*.xcodeproj/xcshareddata/swiftpm
+*.o
+*.d
+*.out
+
+# -------------------------
+# Node.js (for frontend test harness)
+# -------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log
+yarn-error.log
+
+
+# Puppeteer downloads (Chrome binaries)
+.puppeteer/
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+
+# -------------------------
+# Cache
+# -------------------------
+.cache/
+dist/
+
+# -------------------------
+# Other
+# -------------------------
+*.tmp
+*.swp
+*.swo
