@@ -245,6 +245,24 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/darwin-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/darwin-x64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/ios-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/ios-arm64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/ios-x64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/darwin-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/darwin-x64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/ios-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/ios-arm64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/ios-x64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/darwin-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/darwin-x64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/ios-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/ios-arm64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/ios-x64-simulator",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Debug;
@@ -253,6 +271,24 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/darwin-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/darwin-x64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/ios-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/ios-arm64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-fs/prebuilds/ios-x64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/darwin-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/darwin-x64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/ios-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/ios-arm64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-os/prebuilds/ios-x64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/darwin-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/darwin-x64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/ios-arm64",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/ios-arm64-simulator",
+					"$(PROJECT_DIR)/CapstoneProjectCIS22C/node_modules/bare-url/prebuilds/ios-x64-simulator",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 			};
 			name = Release;

@@ -16,8 +16,26 @@
 std::string airlinesOrderedByIataToJson(int limit, int offset);
 std::string airportsOrderedByIataToJson(int limit, int offset);
 
-// ---------- Helpers for parsing ----------
+struct Route {
+    std::string airline;      // airline code (IATA or ICAO)
+    int airlineId;            // OpenFlights airline ID
+    std::string srcAirport;   // source airport code (IATA or ICAO)
+    int srcAirportId;         // source airport ID
+    std::string dstAirport;   // destination airport code
+    int dstAirportId;         // destination airport ID
+    bool codeshare;           // true if "Y"
+    int stops;                // number of stops
+    std::string equipment;    // space-separated plane types
+};
 
+// ---------- Helpers for parsing ----------
+bool getCoordinatesForRoute(const Route &r,
+                            double &srcLat, double &srcLon,
+                            double &dstLat, double &dstLon);
+
+double haversineMiles(double lat1, double lon1, double lat2, double lon2);
+
+std::string jsonEscape(const std::string &s);
 bool isNullField(const std::string &s) {
     return s.empty() || s == "\\N";
 }
@@ -157,17 +175,7 @@ struct Airline {
     bool active;          // true if "Y", false if "N" or unknown
 };
 
-struct Route {
-    std::string airline;      // airline code (IATA or ICAO)
-    int airlineId;            // OpenFlights airline ID
-    std::string srcAirport;   // source airport code (IATA or ICAO)
-    int srcAirportId;         // source airport ID
-    std::string dstAirport;   // destination airport code
-    int dstAirportId;         // destination airport ID
-    bool codeshare;           // true if "Y"
-    int stops;                // number of stops
-    std::string equipment;    // space-separated plane types
-};
+
 
 // ---------- Global collections ----------
 
@@ -179,6 +187,14 @@ std::unordered_map<std::string, const Airline*> g_airlinesByIata;
 
 std::vector<Route> g_routes;
 
+// 1. Map: Airport IATA/ICAO code -> List of routes originating at that airport
+std::unordered_map<std::string, std::vector<const Route*>> g_routesBySrcAirport;
+
+// 2. Map: Airport IATA/ICAA code -> List of routes terminating at that airport
+std::unordered_map<std::string, std::vector<const Route*>> g_routesByDstAirport;
+
+// 3. Map: OpenFlights Airline ID -> List of all routes flown by that airline
+std::unordered_map<int, std::vector<const Route*>> g_routesByAirlineId;
 // ---------- Loaders ----------
 
 void loadAirports(const std::string &filename) {
@@ -317,7 +333,34 @@ void loadRoutes(const std::string &filename) {
     
     std::cout << "Loaded " << g_routes.size()
     << " routes from " << filename << "\n";
+    // ⚠️ DOUBLE-CHECK: Clear indices before populating them (prevents duplicates)
+    g_routesBySrcAirport.clear();
+    g_routesByDstAirport.clear();
+    g_routesByAirlineId.clear();
+    
+    // --- NEW: Populate Indices ---
+    for (const auto &r : g_routes) {
+        // 1. Index by Source Airport Code (for departing flights)
+        if (!r.srcAirport.empty() && !isNullField(r.srcAirport)) {
+            g_routesBySrcAirport[r.srcAirport].push_back(&r);
+        }
+        
+        // 2. Index by Destination Airport Code (for arriving flights)
+        if (!r.dstAirport.empty() && !isNullField(r.dstAirport)) {
+            g_routesByDstAirport[r.dstAirport].push_back(&r);
+        }
+        
+        // 3. Index by Airline ID (Route::airlineId matches Airline::id)
+        if (r.airlineId != -1) {
+            g_routesByAirlineId[r.airlineId].push_back(&r);
+        }
+    }
+    std::cout << "Built route indices for "
+    << g_routesByAirlineId.size() << " airlines, "
+    << g_routesBySrcAirport.size() << " source airports, and "
+    << g_routesByDstAirport.size() << " destination airports.\n";
 }
+
 
 // ---------- HTTP helpers ----------
 
@@ -515,28 +558,37 @@ const Airline* findAirlineByCode(const std::string &code) {
 // }
 
 
+// Report: for a given airline, count how many routes touch each airport
+// (both src and dst), then sort airports by that count descending and
+// return a JSON object. This version uses the g_routesByAirlineId index for O(1) lookup.
 std::string airlineRoutesReportToJson(const Airline &al) {
-    // 1. Count how many times each airport code appears in routes for this airline
+    
+    // 1. Get the relevant routes using the index (O(1) lookup)
+    std::vector<const Route*> routesToProcess;
+    
+    if (al.id != -1) {
+        auto it = g_routesByAirlineId.find(al.id);
+        if (it != g_routesByAirlineId.end()) {
+            routesToProcess = it->second;
+        }
+    } else {
+        // Fallback: If airline has no ID, we must skip. The linear scan fallback
+        // is too slow and unnecessary for the primary use case.
+        // We could also attempt a slow linear scan using IATA/ICAO code here,
+        // but prefer index use for performance.
+    }
+    
+    if (routesToProcess.empty()) {
+        std::ostringstream oss;
+        oss << "{ \"airline\":" << airlineToJson(al) << ", \"airports\":[] }";
+        return oss.str();
+    }
+    
+    // 2. Count how many times each airport code appears in the identified routes
     std::unordered_map<std::string, int> counts;
     
-    for (const auto &r : g_routes) {
-        bool matches = false;
-        
-        // Prefer matching by airline ID when available
-        if (r.airlineId != -1 && r.airlineId == al.id) {
-            matches = true;
-        } else {
-            // Fall back to matching by code (IATA/ICAO)
-            if (!r.airline.empty()) {
-                if (!al.iata.empty() && r.airline == al.iata) {
-                    matches = true;
-                } else if (!al.icao.empty() && r.airline == al.icao) {
-                    matches = true;
-                }
-            }
-        }
-        
-        if (!matches) continue;
+    for (const auto *rPtr : routesToProcess) {
+        const auto &r = *rPtr;
         
         // Count both source and destination airports for this airline
         if (!r.srcAirport.empty() && !isNullField(r.srcAirport)) {
@@ -547,7 +599,7 @@ std::string airlineRoutesReportToJson(const Airline &al) {
         }
     }
     
-    // 2. Move counts into a vector and attach Airport* if we can resolve the code
+    // 3. Move counts into a vector and attach Airport* if we can resolve the code
     struct AirportCount {
         std::string code;
         int count;
@@ -570,14 +622,14 @@ std::string airlineRoutesReportToJson(const Airline &al) {
         list.push_back(AirportCount{code, count, ap});
     }
     
-    // 3. Sort by route count descending, then by code ascending
+    // 4. Sort by route count descending, then by code ascending
     std::sort(list.begin(), list.end(),
               [](const AirportCount &a, const AirportCount &b) {
         if (a.count != b.count) return a.count > b.count;
         return a.code < b.code;
     });
     
-    // 4. Build JSON object
+    // 5. Build JSON object
     std::ostringstream oss;
     oss << "{";
     
@@ -615,6 +667,79 @@ std::string airlineRoutesReportToJson(const Airline &al) {
 }
 
 
+// Builds a GeoJSON FeatureCollection containing LineString features
+// for the given list of routes, ensuring all string properties are escaped.
+std::string routesToGeoJson(const std::vector<const Route*> &routes) {
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"type\":\"FeatureCollection\",";
+    oss << "\"features\":[";
+    
+    bool firstFeature = true;
+    for (const auto *rPtr : routes) {
+        const Route &r = *rPtr;
+        double srcLat, srcLon, dstLat, dstLon;
+        
+        // Skip routes where we can't resolve coordinates
+        if (!getCoordinatesForRoute(r, srcLat, srcLon, dstLat, dstLon)) {
+            continue;
+        }
+        
+        // Resolve airline (needed for feature properties)
+        const Airline *al = nullptr;
+        if (r.airlineId != -1) {
+            al = findAirlineById(r.airlineId);
+        }
+        
+        if (!firstFeature) oss << ",";
+        firstFeature = false;
+        
+        // Start Feature object
+        oss << "{";
+        oss << "\"type\":\"Feature\",";
+        
+        // Geometry: LineString
+        oss << "\"geometry\":{";
+        oss << "\"type\":\"LineString\",";
+        // GeoJSON standard: coordinates are [longitude, latitude]
+        oss << "\"coordinates\":[";
+        oss << "[" << srcLon << "," << srcLat << "],";
+        oss << "[" << dstLon << "," << dstLat << "]";
+        oss << "]"; // end coordinates
+        oss << "},"; // end geometry
+        
+        // Properties: Metadata about the route
+        oss << "\"properties\":{";
+        
+        // ⚠️ TIGHTEN UP: JSON escape all string properties for safety
+        oss << "\"airline_code\":\""
+        << jsonEscape(al ? al->iata : r.airline) << "\",";
+        oss << "\"airline_name\":\""
+        << jsonEscape(al ? al->name : std::string("Unknown")) << "\",";
+        oss << "\"src_iata\":\""
+        << jsonEscape(r.srcAirport) << "\",";
+        oss << "\"dst_iata\":\""
+        << jsonEscape(r.dstAirport) << "\",";
+        
+        oss << "\"codeshare\":" << (r.codeshare ? "true" : "false") << ",";
+        oss << "\"stops\":" << r.stops << "";
+        
+        // Distance calculation and formatting
+        double distance = haversineMiles(srcLat, srcLon, dstLat, dstLon);
+        // Note: std::fixed and std::setprecision are included via <iomanip>
+        oss << ",\"distance_mi\":" << std::fixed << std::setprecision(1) << distance;
+        
+        oss << "}"; // end properties
+        
+        oss << "}"; // end Feature object
+    }
+    
+    oss << "]"; // end features array
+    oss << "}"; // end FeatureCollection
+    
+    return oss.str();
+}
+
 // Report: for a given airport, count how many routes each airline operates
 // to/from this airport, then sort airlines by that count descending and
 // return a JSON object:
@@ -629,22 +754,34 @@ std::string airlineRoutesReportToJson(const Airline &al) {
 //     ...
 //   ]
 // }
+// Report: for a given airport, count how many routes each airline operates
+// to/from this airport. This version uses the source/destination indices for O(1) lookup.
 std::string airportAirlinesReportToJson(const Airport &ap) {
-    // 1. Count routes per airline involving this airport.
+    // 1. Identify all routes originating from or terminating at this airport (O(1) lookup)
+    
+    std::vector<const Route*> routesToProcess;
+    
+    // Check Source Index (Departing routes)
+    auto itSrc = g_routesBySrcAirport.find(ap.iata);
+    if (itSrc != g_routesBySrcAirport.end()) {
+        routesToProcess.insert(routesToProcess.end(), itSrc->second.begin(), itSrc->second.end());
+    }
+    
+    // Check Destination Index (Arriving routes)
+    auto itDst = g_routesByDstAirport.find(ap.iata);
+    if (itDst != g_routesByDstAirport.end()) {
+        routesToProcess.insert(routesToProcess.end(), itDst->second.begin(), itDst->second.end());
+    }
+    
+    // 2. Count routes per airline.
     std::unordered_map<int, int> countsById;        // airlineId -> count
     std::unordered_map<std::string, int> tempCodeCounts; // code -> count (for routes with airlineId == -1)
     
-    auto matchesAirport = [&](const Route &r) -> bool {
-        // Routes may use IATA or ICAO codes. Compare against both if available.
-        bool srcMatch = (!r.srcAirport.empty() &&
-                         (r.srcAirport == ap.iata || (!ap.icao.empty() && r.srcAirport == ap.icao)));
-        bool dstMatch = (!r.dstAirport.empty() &&
-                         (r.dstAirport == ap.iata || (!ap.icao.empty() && r.dstAirport == ap.icao)));
-        return srcMatch || dstMatch;
-    };
-    
-    for (const auto &r : g_routes) {
-        if (!matchesAirport(r)) continue;
+    for (const auto *rPtr : routesToProcess) {
+        const auto &r = *rPtr;
+        
+        // The check r.srcAirport == ap.iata is implicit because we used the indices.
+        // We now just need to tally the airlines.
         
         if (r.airlineId != -1) {
             countsById[r.airlineId] += 1;
@@ -654,13 +791,15 @@ std::string airportAirlinesReportToJson(const Airport &ap) {
         }
     }
     
-    // 2. Try to fold code-based counts into ID-based counts when possible.
+    // 3. Try to fold code-based counts into ID-based counts when possible.
     std::unordered_map<std::string, int> unresolvedCodes; // codes we still couldn't resolve by ID
     
     for (const auto &kv : tempCodeCounts) {
         const std::string &code = kv.first;
         int count = kv.second;
         
+        // We reuse findAirlineByCode (which may still be a slow linear scan on ICAO, but that's fine
+        // since tempCodeCounts is small—only containing routes missing an ID).
         const Airline *al = findAirlineByCode(code);
         if (al && al->id != -1) {
             countsById[al->id] += count;
@@ -669,7 +808,7 @@ std::string airportAirlinesReportToJson(const Airport &ap) {
         }
     }
     
-    // 3. Build a list of airlines + counts.
+    // 4. Build a list of airlines + counts.
     struct AirlineCount {
         const Airline *airline;   // may be nullptr if unknown
         std::string codeOrId;     // for display when airline == nullptr
@@ -707,7 +846,7 @@ std::string airportAirlinesReportToJson(const Airport &ap) {
         list.push_back(AirlineCount{al, code, count});
     }
     
-    // 4. Sort by route count descending, then by airline name or codeOrId.
+    // 5. Sort by route count descending, then by airline name or codeOrId.
     std::sort(list.begin(), list.end(),
               [](const AirlineCount &a, const AirlineCount &b) {
         if (a.count != b.count) return a.count > b.count;
@@ -718,7 +857,7 @@ std::string airportAirlinesReportToJson(const Airport &ap) {
         return nameA < nameB;
     });
     
-    // 5. Build JSON.
+    // 6. Build JSON.
     std::ostringstream oss;
     oss << "{";
     
@@ -811,6 +950,26 @@ const Airport* findAirportByIata(const std::string &code) {
     auto it = g_airportsByIata.find(code);
     if (it == g_airportsByIata.end()) return nullptr;
     return it->second;
+}
+// Helper function to get the coordinates (lon, lat) of a route's endpoints.
+// Returns true on success, false if either airport code is unresolved.
+bool getCoordinatesForRoute(const Route &r,
+                            double &srcLat, double &srcLon,
+                            double &dstLat, double &dstLon) {
+    
+    const Airport *srcAp = findAirportByIata(r.srcAirport);
+    const Airport *dstAp = findAirportByIata(r.dstAirport);
+    
+    if (!srcAp || !dstAp) {
+        return false;
+    }
+    
+    srcLat = srcAp->latitude;
+    srcLon = srcAp->longitude;
+    dstLat = dstAp->latitude;
+    dstLon = dstAp->longitude;
+    
+    return true;
 }
 
 // Haversine distance in miles between two lat/lon points (degrees).
@@ -965,34 +1124,34 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
     auto isSpace = [](unsigned char ch){ return std::isspace(ch); };
     while (!q.empty() && isSpace((unsigned char)q.front())) q.erase(q.begin());
     while (!q.empty() && isSpace((unsigned char)q.back()))  q.pop_back();
-
+    
     if (q.empty()) {
         return "[]";
     }
-
+    
     // lowercase copy of query
     std::transform(q.begin(), q.end(), q.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-
+    
     struct Candidate {
         const Airport* ap;
         int score;
         std::string display;
     };
-
+    
     std::vector<Candidate> candidates;
     candidates.reserve(64);
-
+    
     for (const auto &ap : g_airports) {
         if (ap.iata.empty()) continue; // only real IATA airports
-
+        
         // lowercase fields for comparison
         std::string iata = ap.iata;
         std::string city = ap.city;
         std::string name = ap.name;
         std::string country = ap.country;
         std::string type = ap.type;
-
+        
         auto lowerInPlace = [](std::string &s) {
             std::transform(s.begin(), s.end(), s.begin(),
                            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
@@ -1002,9 +1161,9 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
         lowerInPlace(name);
         lowerInPlace(country);
         lowerInPlace(type);
-
+        
         int score = 0;
-
+        
         // ---- Matching on IATA code ----
         if (iata == q) {
             // Exact code match: user probably typed the code
@@ -1016,7 +1175,7 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
             // IATA contains query somewhere
             score += 60;
         }
-
+        
         // ---- Matching on city name ----
         if (!city.empty()) {
             if (city == q) {
@@ -1028,7 +1187,7 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
                 score += 70;
             }
         }
-
+        
         // ---- Matching on airport name (usually "San Diego International Airport") ----
         if (!name.empty()) {
             if (name.size() >= q.size() && name.compare(0, q.size(), q) == 0) {
@@ -1037,12 +1196,12 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
                 score += 40;
             }
         }
-
+        
         // If there was no textual match at all, skip
         if (score == 0) {
             continue;
         }
-
+        
         // ---- Hub / size weighting ----
         // These use the OurAirports "type" field.
         if (type == "large_airport") {
@@ -1054,13 +1213,13 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
         } else {
             // heliport / closed / etc. get nothing extra
         }
-
+        
         // ---- Country bias (optional, tweakable) ----
         // Slight preference for US airports since that's your main use case.
         if (country == "united states" || country == "united states of america") {
             score += 20;
         }
-
+        
         // Build display string: "City, Country (IATA)"
         std::string display = ap.city;
         if (!ap.country.empty()) {
@@ -1073,28 +1232,28 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
             display += ap.iata;
             display += ")";
         }
-
+        
         candidates.push_back(Candidate{&ap, score, display});
     }
-
+    
     // Nothing matched
     if (candidates.empty()) {
         return "[]";
     }
-
+    
     // Sort by score DESC, then by display ASC as a tie-breaker
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate &a, const Candidate &b) {
-                  if (a.score != b.score) return a.score > b.score;
-                  return a.display < b.display;
-              });
-
+        if (a.score != b.score) return a.score > b.score;
+        return a.display < b.display;
+    });
+    
     // Apply limit
     if (limit <= 0) limit = 10;
     if ((int)candidates.size() > limit) {
         candidates.resize(limit);
     }
-
+    
     // Emit JSON
     std::ostringstream oss;
     oss << "[";
@@ -1103,14 +1262,14 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
         const Airport &ap = *cand.ap;
         if (!firstOut) oss << ",";
         firstOut = false;
-
+        
         oss << "{"
-            << "\"code\":\""    << ap.iata << "\","
-            << "\"name\":\""    << jsonEscape(ap.name) << "\","
-            << "\"city\":\""    << jsonEscape(ap.city) << "\","
-            << "\"country\":\"" << jsonEscape(ap.country) << "\","
-            << "\"display\":\"" << jsonEscape(cand.display) << "\""
-            << "}";
+        << "\"code\":\""    << ap.iata << "\","
+        << "\"name\":\""    << jsonEscape(ap.name) << "\","
+        << "\"city\":\""    << jsonEscape(ap.city) << "\","
+        << "\"country\":\"" << jsonEscape(ap.country) << "\","
+        << "\"display\":\"" << jsonEscape(cand.display) << "\""
+        << "}";
     }
     oss << "]";
     return oss.str();
@@ -1208,6 +1367,10 @@ int main() {
             <meta charset="UTF-8" />
             <title>OpenFlights Route Finder</title>
             <meta name="viewport" content="width=device-width, initial-scale=1" />
+             <!-- NEW: Mapbox CSS + JS -->
+                <link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet" />
+                <script src="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js"></script>
+
             <style>
                 body {
                     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1231,31 +1394,31 @@ int main() {
             gap: 1rem;
             margin-bottom: 0.75rem;
         }
-
+        
         .header-left h1 {
             margin: 0;
             font-size: 1.7rem;
         }
-
+        
         .subtitle {
             font-size: 0.85rem;
             color: #6b7280;
             margin-top: 0.15rem;
         }
-
+        
         .header-right {
             display: flex;
             align-items: center;
             justify-content: flex-end;
         }
-
+        
         .top-tabs {
             display: inline-flex;
             background: #e5e7eb;
             border-radius: 999px;
             padding: 0.1rem;
         }
-
+        
         .top-tab {
             border: none;
             background: transparent;
@@ -1267,23 +1430,23 @@ int main() {
             color: #4b5563;
             white-space: nowrap;
         }
-
+        
         .top-tab.active {
             background: #111827;
             color: #f9fafb;
         }
-
+        
         .id-panel {
             margin-bottom: 0.75rem;
             display: none; /* default hidden; JS turns it on */
         }
-
+        
         .id-panel-status {
             font-size: 0.8rem;
             color: #6b7280;
             margin-bottom: 0.25rem;
         }
-
+        
         .id-panel-body {
             display: inline-block;
             padding: 0.6rem 0.8rem;
@@ -1469,11 +1632,11 @@ int main() {
             border-radius: 999px;
             font-weight: 500;
         }
-
+        
         .view-tab:hover {
             background: #d1d5db;
         }
-
+        
         .view-tab.active {
             background: #111827;
             color: #f9fafb;
@@ -1483,7 +1646,7 @@ int main() {
         .autocomplete-container {
           position: relative;
         }
-
+        
         .autocomplete-list {
           position: absolute;
           top: 100%;
@@ -1498,18 +1661,18 @@ int main() {
           border: 1px solid #e5e7eb;
           box-shadow: 0 10px 25px rgba(15,23,42,0.15);
         }
-
+        
         .autocomplete-item {
           padding: 0.4rem 0.6rem;
           font-size: 0.9rem;
           cursor: pointer;
         }
-
+        
         .autocomplete-item:hover,
         .autocomplete-item.active {
           background: #f3f4f6;
         }
-
+        
         .autocomplete-empty {
           padding: 0.4rem 0.6rem;
           font-size: 0.85rem;
@@ -1587,7 +1750,34 @@ int main() {
             gap: 0.4rem;
             margin-bottom: 0.5rem;
         }
-        
+        .layover-filter-bar {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.4rem;
+          margin-bottom: 0.75rem;
+          align-items: center;
+        }
+
+        .layover-pill {
+          border-radius: 999px;
+          padding: 0.15rem 0.55rem;
+          border: 1px solid #ddd;
+          font-size: 0.78rem;
+          background: #f8f8f8;
+          cursor: pointer;
+        }
+
+        .layover-pill.active {
+          background: #2563eb;
+          border-color: #2563eb;
+          color: #fff;
+        }
+
+        .layover-pill .pill-count {
+          font-size: 0.68rem;
+          opacity: 0.8;
+          margin-left: 0.25rem;
+        }
         /* Small clickable filter pills (AA, UA, DL, etc.) */
         .filter-pill {
             border: none;
@@ -1612,6 +1802,70 @@ int main() {
             background: #111827;
             color: #f9fafb;
         }
+        /* “Clear filters” pill-style button */
+        .clear-filters-btn {
+          border-radius: 999px;
+          border: 1px solid #d1d5db;
+          background: #f9fafb;
+          color: #374151;
+          font-size: 0.78rem;
+          font-weight: 500;
+          padding: 0.2rem 0.9rem;
+          cursor: pointer;
+          white-space: nowrap;
+          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+        }
+
+        .clear-filters-btn:hover {
+          background: #e5e7eb;
+        }
+        /* Scrollable code / JSON box (matches the JSON style you liked) */
+        .scroll-pre {
+          background: #020617;          /* same dark background */
+          color: #e5e7eb;
+          padding: 0.75rem;
+          border-radius: 0.5rem;
+          font-size: 0.8rem;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                       "Liberation Mono", "Courier New", monospace;
+          max-height: 24rem;
+          overflow: auto;
+          white-space: pre;
+        }
+        
+        /* Code panel container (for the Get Code section) */
+        .code-panel {
+          margin-top: 0.75rem;
+          border-radius: 0.75rem;
+          background: #0b1120;
+          border: 1px solid #1e293b;
+          padding: 0.75rem;
+        }
+        
+        .code-panel .panel-status {
+          font-size: 0.8rem;
+          color: #94a3b8;
+          margin-bottom: 0.5rem;
+        }
+        #routeMap {
+          height: 320px;
+          margin-top: 1rem;
+          margin-bottom: 1rem;
+          border-radius: 8px;
+        }
+        #homeRouteMap {
+                            height: 400px;
+                            margin-top: 1rem;
+                            margin-bottom: 1rem;
+                            border-radius: 8px;
+                        }
+                        /* NEW: Added hover effect for clickable cards */
+                        .route-card.clickable:hover {
+                            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
+                            cursor: pointer;
+                            transform: translateY(-1px);
+                            transition: all 0.2s ease;
+                        }
             </style>
         </head>
         <body>
@@ -1645,13 +1899,19 @@ int main() {
                 
               </div>
             </div>
-
+        
             <!-- This panel appears under the tabs when "Student" is selected -->
             <div id="idPanel" class="id-panel" style="display:none;">
               <div id="idPanelStatus" class="id-panel-status"></div>
               <div id="idPanelBody" class="id-panel-body"></div>
             </div>
-
+            
+        <!-- CODE PANEL (hidden by default, shows /code contents in scrollable box) -->
+        
+            <div id="codePanel" class="code-panel" style="display:none">
+              <div id="codePanelStatus" class="panel-status"></div>
+              <pre id="codePanelBody" class="scroll-pre"></pre>
+            </div>
             <form id="route-form">
                <div class="field-group">
                                    <div class="field autocomplete-container">
@@ -1701,15 +1961,33 @@ int main() {
             </form>
         
             <h3>Results</h3>
+        
+            <div id="homeRouteMap"></div>
 
-            <div class="view-mode-tabs" id="viewModeTabs">
-                <button class="view-tab active" data-mode="cards">Cards</button>
-                <button class="view-tab" data-mode="json">JSON</button>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-top:0.25rem;margin-bottom:0.4rem;">
+                <div class="view-mode-tabs" id="viewModeTabs">
+                    <button class="view-tab active" data-mode="cards">Cards</button>
+                    <button class="view-tab" data-mode="json">JSON</button>
+                </div>
+
+                <!-- NEW: Clear Filters button on the right -->
+                <button type="button" id="clearFiltersBtn" class="clear-filters-btn">
+                    Clear filters
+                </button>
             </div>
 
-            <!-- Airline filter pills live here -->
-            <div id="airlineFilters" class="airline-filter-bar"></div>
+          <div class="filters-row">
+            <div class="filters-left">
+              <div id="layoverFilters" class="layover-filter-bar"></div>
+              <!-- Airline filter pills live here -->
+              <div id="airlineFilters" class="airline-filter-bar"></div>
+            </div>
 
+            <button id="clearFiltersButton" type="button" class="clear-filters-btn">
+              Clear filters
+            </button>
+          </div>
+        
             <div id="resultsList" class="results-list">
                 <p class="no-results">(no results yet)</p>
             </div>
@@ -1718,72 +1996,270 @@ int main() {
         (function () {
             const studentTab = document.getElementById("studentTab");
             const codeTab    = document.getElementById("codeTab");
-            const idPanel    = document.getElementById("idPanel");
-            const idPanelStatus = document.getElementById("idPanelStatus");
-            const idPanelBody   = document.getElementById("idPanelBody");
+        
+            const idPanel        = document.getElementById("idPanel");
+            const idPanelStatus  = document.getElementById("idPanelStatus");
+            const idPanelBody    = document.getElementById("idPanelBody");
+        
+            const codePanel       = document.getElementById("codePanel");
+            const codePanelStatus = document.getElementById("codePanelStatus");
+            const codePanelBody   = document.getElementById("codePanelBody");
 
-            let idLoaded = false;
-            let studentOpen = false;   // <--- new: tracks if panel is open
+            let idLoaded    = false;
+            let studentOpen = false;
+            let codeLoaded  = false;
+            let codeOpen    = false;
+        
+        mapboxgl.accessToken = 'pk.eyJ1IjoiY2hyaXN0aW5lcnlhbjkzIiwiYSI6ImNtaWJnZDhiMDAxN2sya29sNXZvNHExMXkifQ.6K3wdjmIhFRQD3bre4f_DA';
 
+                    const INITIAL_CENTER = [-98.5, 39.8]; // Center of the US (approx)
+                    const INITIAL_ZOOM = 2; // World view
+                    
+                    // Map instance (container ID changed to homeRouteMap)
+                    const homeMap = new mapboxgl.Map({
+                        container: 'homeRouteMap',
+                        style: 'mapbox://styles/mapbox/light-v11',
+                        center: INITIAL_CENTER,
+                        zoom: INITIAL_ZOOM
+                    });
+                    
+                    let homeMapIsLoaded = false; 
+                    let activeRouteId = null; // Stores the ID of the currently selected route
+                    
+                    homeMap.on('load', () => {
+                                    homeMapIsLoaded = true;
+                                    // Initialize the two layers we'll use: a base layer and a highlight layer.
+                                    homeMap.addSource('route-display-source', {
+                                        'type': 'geojson',
+                                        'data': { type: 'FeatureCollection', features: [] }
+                                    });
+
+                                    // 1. Base Layer (Thin, low opacity)
+                                    homeMap.addLayer({
+                                        'id': 'routes-base-layer',
+                                        'type': 'line',
+                                        'source': 'route-display-source',
+                                        'layout': { 'line-join': 'round', 'line-cap': 'round' },
+                                        'paint': {
+                                            'line-color': '#9ca3af', // Gray
+                                            'line-width': 1.0,
+                                            'line-opacity': 0.6
+                                        }
+                                    });
+
+                                    // 2. Highlight Layer (Thick, bright color, filtered to one route)
+                                    homeMap.addLayer({
+                                        'id': 'routes-highlight-layer',
+                                        'type': 'line',
+                                        'source': 'route-display-source',
+                                        // CORRECTED FILTER SYNTAX: Filter on the 'id' property in features.properties
+                                        'filter': ['==', ['get', 'id'], ''], // Start filtered (show nothing)
+                                        'layout': { 'line-join': 'round', 'line-cap': 'round' },
+                                        'paint': {
+                                            'line-color': '#2563eb', // Bright Blue
+                                            'line-width': 3.0,
+                                            'line-opacity': 1.0
+                                        }
+                                    });
+                                });
+                    // --- End Mapbox Setup ---
+        /** Removes all data and highlights from the home map (safer implementation). */
+                    function clearHomeMap() {
+                        activeRouteId = null;
+                        if (!homeMapIsLoaded) return;
+
+                        const src = homeMap.getSource('route-display-source');
+                        if (src) {
+                            // Set source data to empty
+                            src.setData({ type: 'FeatureCollection', features: [] });
+                        }
+
+                        // Set highlight filter to empty if the layer exists
+                        if (homeMap.getLayer('routes-highlight-layer')) {
+                            homeMap.setFilter('routes-highlight-layer', ['==', ['get', 'id'], '']);
+                        }
+                        
+                        homeMap.flyTo({ center: INITIAL_CENTER, zoom: INITIAL_ZOOM });
+                    }
+
+                    /** Updates the Mapbox highlight filter to show one route. */
+                    function highlightRoute(routeId) {
+                        activeRouteId = routeId;
+                        if (!homeMapIsLoaded) return;
+                        
+                        // CORRECTED FILTER SYNTAX: Use ['get', 'id'] to filter on feature property
+                        homeMap.setFilter('routes-highlight-layer', ['==', ['get', 'id'], routeId]);
+                    }
+
+                    /**
+                     * Renders routes on the map using the filtered array to ensure index alignment.
+                     * @param {string} mode - 'direct' or 'onehop'
+                     * @param {object} data - The full JSON response (for shared properties like source/destination)
+                     * @param {Array} filteredRoutes - The routes array that is actually displayed as cards
+                     */
+                    function renderRoutesOnHomeMap(mode, data, filteredRoutes) {
+                        clearHomeMap();
+                        if (!homeMapIsLoaded) return;
+                        
+                        const features = [];
+                        let bounds = new mapboxgl.LngLatBounds();
+                        let hasBounds = false;
+
+                        filteredRoutes.forEach((route, index) => {
+                            // Data check: Assumes data.source and data.destination are available.
+                            const src = data.source;
+                            const dst = data.destination;
+                            
+                            if (!src || !dst || src.longitude === undefined || dst.longitude === undefined) {
+                                return;
+                            }
+                            
+                            const id = mode + '-' + index;
+                            let coordinates;
+                            
+                            if (mode === 'direct') {
+                                // Direct flight: Source to Destination
+                                coordinates = [[src.longitude, src.latitude], [dst.longitude, dst.latitude]];
+                            } else { 
+                                // One-hop flight: Source to Via to Destination
+                                // Assumes 'route' (a hop object) contains a 'via' airport object
+                                const via = route.viaAirport || route.via; // Use route.via for consistency
+                                
+                                if (!via || via.longitude === undefined) {
+                                     return; // Skip if via airport data is missing
+                                }
+                                
+                                coordinates = [
+                                    [src.longitude, src.latitude],
+                                    [via.longitude, via.latitude],
+                                    [dst.longitude, dst.latitude]
+                                ];
+                            }
+
+                            coordinates.forEach(c => { bounds.extend(c); hasBounds = true; });
+
+                            features.push({
+                                'type': 'Feature',
+                                'geometry': {
+                                    'type': 'LineString',
+                                    'coordinates': coordinates
+                                },
+                                'properties': {
+                                    'id': id,
+                                    'route_id': id, // Redundant but harmless, using 'id' for the filter
+                                }
+                            });
+                        });
+                        
+                        // Update the Mapbox source with all the features
+                        homeMap.getSource('route-display-source').setData({
+                            type: 'FeatureCollection',
+                            features: features
+                        });
+
+                        // Fit map to bounds if we have routes
+                        if (hasBounds) {
+                            homeMap.fitBounds(bounds, {
+                                padding: 80, 
+                                maxZoom: 6,
+                                duration: 1000
+                            });
+                        }
+                    }
             function setActiveTopTab(which) {
-                // which: "student", "code", or null
-                if (which === "student") {
-                    studentTab.classList.add("active");
-                } else {
-                    studentTab.classList.remove("active");
-                }
-
-                if (which === "code") {
-                    codeTab.classList.add("active");
-                } else {
-                    codeTab.classList.remove("active");
-                }
+              // which: "student", "code", or null
+              if (which === "student") {
+                studentTab.classList.add("active");
+              } else {
+                studentTab.classList.remove("active");
+              }
+        
+              if (which === "code") {
+                codeTab.classList.add("active");
+              } else {
+                codeTab.classList.remove("active");
+              }
             }
         
             // STUDENT tab: toggle open/closed
             studentTab.addEventListener("click", () => {
-                if (studentOpen) {
-                    // Currently open → close it
-                    studentOpen = false;
-                    idPanel.style.display = "none";
-                    setActiveTopTab(null);  // no tab highlighted
-                    return;
-                }
-
-                // Opening the student panel
-                studentOpen = true;
-                idPanel.style.display = "block";
-                setActiveTopTab("student");
-
-                if (!idLoaded) {
-                    idPanelStatus.textContent = "Loading…";
-                    idPanelBody.innerHTML = "";
-                    fetch("/id")
-                        .then(resp => {
-                            if (!resp.ok) throw new Error("HTTP " + resp.status);
-                            return resp.json();
-                        })
-                        .then(data => {
-                            idLoaded = true;
-                            idPanelStatus.textContent = "";
-                            idPanelBody.innerHTML =
-                                "<strong>Name:</strong> " + (data.name || "?") + "<br/>" +
-                                "<strong>Student ID:</strong> " + (data.student_id || "?");
-                        })
-                        .catch(err => {
-                            console.error(err);
-                            idPanelStatus.textContent = "Could not load student info.";
-                        });
-                }
-            });
-
-            // CODE tab: always open code, close student panel
-            codeTab.addEventListener("click", () => {
+              if (studentOpen) {
+                // close student panel
                 studentOpen = false;
                 idPanel.style.display = "none";
-                setActiveTopTab("code");
-                window.open("/code", "_blank");
-            });const form = document.getElementById("route-form");
+                setActiveTopTab(null);
+                return;
+              }
+        
+              // open student panel, close code panel
+              studentOpen = true;
+              codeOpen    = false;
+              codePanel.style.display = "none";
+        
+              idPanel.style.display = "block";
+              setActiveTopTab("student");
+        
+              if (!idLoaded) {
+                idPanelStatus.textContent = "Loading…";
+                idPanelBody.innerHTML = "";
+                fetch("/id")
+                  .then(resp => {
+                    if (!resp.ok) throw new Error("HTTP " + resp.status);
+                    return resp.json();
+                  })
+                  .then(data => {
+                    idLoaded = true;
+                    idPanelStatus.textContent = "";
+                    idPanelBody.innerHTML =
+                      "<strong>Name:</strong> " + (data.name || "?") + "<br/>" +
+                      "<strong>Student ID:</strong> " + (data.student_id || "?");
+                  })
+                  .catch(err => {
+                    console.error(err);
+                    idPanelStatus.textContent = "Could not load student info.";
+                  });
+              }
+            });
+        
+            // CODE tab: toggle open/closed, show /code in scrollable <pre>
+            codeTab.addEventListener("click", () => {
+              if (codeOpen) {
+                // close code panel
+                codeOpen = false;
+                codePanel.style.display = "none";
+                setActiveTopTab(null);
+                return;
+              }
+        
+              // open code panel, close student panel
+              codeOpen    = true;
+              studentOpen = false;
+              idPanel.style.display = "none";
+        
+              codePanel.style.display = "block";
+              setActiveTopTab("code");
+        
+              if (!codeLoaded) {
+                codePanelStatus.textContent = "Loading code…";
+                codePanelBody.textContent = "";
+        
+                fetch("/code")
+                  .then(resp => {
+                    if (!resp.ok) throw new Error("HTTP " + resp.status);
+                    return resp.text();
+                  })
+                  .then(text => {
+                    codeLoaded = true;
+                    codePanelStatus.textContent = "";
+                    codePanelBody.textContent = text;  // goes into the <pre>
+                  })
+                  .catch(err => {
+                    console.error(err);
+                    codePanelStatus.textContent = "Could not load code.";
+                  });
+              }
+            });
+            const form = document.getElementById("route-form");
             const srcInput = document.getElementById("src");
             const dstInput = document.getElementById("dst");
             const srcSuggestions = document.getElementById("src-suggestions");
@@ -1796,7 +2272,8 @@ int main() {
             const airlineFilters = document.getElementById("airlineFilters");
             const viewModeTabs = document.getElementById("viewModeTabs");
             const viewTabButtons = viewModeTabs.querySelectorAll(".view-tab");
-           
+            const layoverFilters = document.getElementById("layoverFilters");
+            const clearFiltersBtn = document.getElementById("clearFiltersBtn");
             
         // "cards" or "json"
             let viewMode = "cards";
@@ -1811,7 +2288,7 @@ int main() {
                 "332": "Airbus A330-200",
                 "333": "Airbus A330-300",
                 "388": "Airbus A380-800",
-
+        
                 // Boeing narrow-body
                 "732": "Boeing 737-200",
                 "733": "Boeing 737-300",
@@ -1823,7 +2300,7 @@ int main() {
                 "739": "Boeing 737-900",
                 "73G": "Boeing 737-700",
                 "73W": "Boeing 737-700 (winglets)",
-
+        
                 // Boeing wide-body (some common ones)
                 "744": "Boeing 747-400",
                 "752": "Boeing 757-200",
@@ -1837,7 +2314,7 @@ int main() {
                 "788": "Boeing 787-8",
                 "789": "Boeing 787-9",
                 "78X": "Boeing 787-10",
-
+        
                 // Regional jets / turboprops (a small sample)
                 "CR2": "Bombardier CRJ200",
                 "CR7": "Bombardier CRJ700",
@@ -1849,13 +2326,13 @@ int main() {
                 "DH4": "De Havilland Canada DHC-8-400"
                 // anything not listed will just show its raw code
             };
-
+        
             // Turn "738 320 319 739 73G" → "Boeing 737-800, Airbus A320, Airbus A319, Boeing 737-900, Boeing 737-700"
             function formatEquipment(equipmentStr) {
                 if (!equipmentStr) return "";
                 const seen = new Set();
                 const labels = [];
-
+        
                 equipmentStr.split(/\s+/).forEach(code => {
                     if (!code) return;
                     if (seen.has(code)) return;      // dedupe
@@ -1863,7 +2340,7 @@ int main() {
                     const label = AIRCRAFT_NAMES[code] || code;  // fallback to raw code if unknown
                     labels.push(label);
                 });
-
+        
                 return labels.join(", ");
             }
             // Remember last results so we can re-render when filter changes
@@ -1871,6 +2348,7 @@ int main() {
             let lastDirectData = null;    // JSON from /direct
             let lastOneHopData = null;    // JSON from /onehop
             let activeAirlineFilter = null; // e.g. "AA" or null for "all"
+            let activeLayoverFilter = null;  // NEW: currently selected via airport, e.g. "DEN"
         
             /** Normalize airline code from an airline object */
             function getAirlineCodeFromObj(airlineObj) {
@@ -1882,6 +2360,17 @@ int main() {
             function setError(msg) {
                 errorEl.textContent = msg || "";
             }
+        /** From a one-hop route object, return the via airport (if any). */
+        function getViaAirportFromHop(hop) {
+            if (!hop) return null;
+
+            // Your JSON likely uses hop.via, but be defensive:
+            if (hop.via) return hop.via;
+            if (hop.via_airport) return hop.via_airport;
+            if (hop.viaAirport) return hop.viaAirport;
+
+            return null;
+        }
         
             function clearResults() {
                 resultsList.innerHTML = "";
@@ -1890,18 +2379,18 @@ int main() {
             function extractIataFromInput(inputEl) {
                             const raw = (inputEl.value || "").trim().toUpperCase();
                             if (!raw) return "";
-
+        
                             // If it ends in "(XXX)" grab XXX
                             const m = raw.match(/\(([A-Z0-9]{3})\)\s*$/);
                             if (m) return m[1];
-
+        
                             // If the whole thing is a 3-letter code, use it
                             if (/^[A-Z0-9]{3}$/.test(raw)) return raw;
-
+        
                             // Fallback: just return whatever (so old behavior still sort-of works)
                             return raw;
                         }
-
+        
                         function getSrcDstOrError() {
                             const src = extractIataFromInput(srcInput);
                             const dst = extractIataFromInput(dstInput);
@@ -1974,19 +2463,117 @@ int main() {
             codes.delete("");
             return codes;
         }
+        function collectLayoverCodesFromOneHop(data) {
+            const codes = new Set();
+            (data.one_hop_routes || []).forEach(hop => {
+                const via = getViaAirportFromHop(hop);
+                if (!via) return;
+                const code = (via.iata || via.icao || "").toUpperCase();
+                if (code) codes.add(code);
+            });
+            codes.delete("");
+            return codes;
+        }
+
+        function renderLayoverFilterBar(data, subset) {
+          layoverFilters.innerHTML = "";
+
+          let codes;
+
+          if (Array.isArray(subset)) {
+            // Build layover set from just the subset of hops
+            const s = new Set();
+            subset.forEach(hop => {
+              const via = getViaAirportFromHop(hop);
+              if (!via) return;
+              const code = (via.iata || via.icao || "").toUpperCase();
+              if (code) s.add(code);
+            });
+            s.delete("");
+            codes = s;
+          } else {
+            // Fallback: all hops
+            codes = collectLayoverCodesFromOneHop(data);
+          }
+
+          if (!codes || !codes.size) {
+            activeLayoverFilter = null;
+            return;
+          }
+
+          // If the current layover filter no longer exists in this subset, clear it
+          if (activeLayoverFilter && !codes.has(activeLayoverFilter)) {
+            activeLayoverFilter = null;
+          }
+
+          // “All layovers” pill
+          const allBtn = document.createElement("button");
+          allBtn.textContent = "All layovers";
+          allBtn.className = "filter-pill" + (activeLayoverFilter ? "" : " active");
+          allBtn.onclick = function () {
+            activeLayoverFilter = null;
+            renderLastResults();
+          };
+          layoverFilters.appendChild(allBtn);
+
+          // One pill per layover code
+          Array.from(codes).sort().forEach(code => {
+            const btn = document.createElement("button");
+            btn.textContent = code;
+            btn.className =
+              "filter-pill" + (activeLayoverFilter === code ? " active" : "");
+            btn.onclick = function () {
+              activeLayoverFilter =
+                activeLayoverFilter === code ? null : code;
+              renderLastResults();
+            };
+            layoverFilters.appendChild(btn);
+          });
+        }
         
-        function renderAirlineFilterBar(mode, data) {
+        function renderAirlineFilterBar(mode, data, subset) {
             airlineFilters.innerHTML = "";
-        
-            const codes = (mode === "direct")
-                ? collectAirlineCodesFromDirect(data)
-                : collectAirlineCodesFromOneHop(data);
-        
-            if (!codes.size) {
+
+            let codes;
+
+            if (mode === "direct") {
+                // subset is an optional array of direct flights
+                if (Array.isArray(subset)) {
+                    const s = new Set();
+                    subset.forEach(f => {
+                        s.add(getAirlineCodeFromObj((f && f.airline) || {}));
+                    });
+                    s.delete("");
+                    codes = s;
+                } else {
+                    codes = collectAirlineCodesFromDirect(data);
+                }
+            } else {
+                // "onehop"
+                if (Array.isArray(subset)) {
+                    const s = new Set();
+                    subset.forEach(hop => {
+                        const first  = hop.first_leg  || {};
+                        const second = hop.second_leg || {};
+                        s.add(getAirlineCodeFromObj(first.airline  || {}));
+                        s.add(getAirlineCodeFromObj(second.airline || {}));
+                    });
+                    s.delete("");
+                    codes = s;
+                } else {
+                    codes = collectAirlineCodesFromOneHop(data);
+                }
+            }
+
+            if (!codes || !codes.size) {
                 activeAirlineFilter = null;
                 return; // nothing to filter on
             }
-        
+            // If current airline filter is not present in this subset, clear it
+                if (activeAirlineFilter && !codes.has(activeAirlineFilter)) {
+                    activeAirlineFilter = null;
+                }
+
             // “All airlines” pill
             const allBtn = document.createElement("button");
             allBtn.textContent = "All airlines";
@@ -1996,7 +2583,7 @@ int main() {
                 renderLastResults();
             };
             airlineFilters.appendChild(allBtn);
-        
+
             // One pill per airline code
             Array.from(codes).sort().forEach(code => {
                 const btn = document.createElement("button");
@@ -2047,8 +2634,10 @@ int main() {
                     resultsList.innerHTML = '<p class="no-results">' + msg + '</p>';
                     return;
                 }
-        
-                flights.forEach(function (flight) {
+                
+                // NEW: Render all available routes on the map before showing cards
+                                renderRoutesOnHomeMap('direct', data, flights); // Pass original data before filtering!
+                flights.forEach(function (flight, index) {
                     const airlineObj = flight.airline || {};
                     const codeshare = !!flight.codeshare;
                     const equipmentLabel = formatEquipment(flight.equipment || "");
@@ -2058,6 +2647,14 @@ int main() {
         
                     const card = document.createElement("div");
                     card.className = "route-card";
+      
+                            card.className = "route-card clickable"; // Added 'clickable' class
+                            
+                            // NEW: Set the route ID and event listener
+                            card.dataset.routeId = 'direct-' + index;
+                            card.addEventListener('click', () => {
+                                highlightRoute(card.dataset.routeId);
+                            });
         
                     card.innerHTML =
                         '<div class="route-main-line">' +
@@ -2077,93 +2674,117 @@ int main() {
                 });
             }
         
-            function renderOneHopResults(data) {
-                lastMode = "onehop";
-                lastOneHopData = data;
+        function renderOneHopResults(data) {
+          lastMode = "onehop";
+          lastOneHopData = data;
 
-                clearResults();
-                renderAirlineFilterBar("onehop", data);
+          clearResults();
 
-                const src = data.source;
-                const dst = data.destination;
-                const allHops = data.one_hop_routes || [];
+          const src = data.source || {};
+          const dst = data.destination || {};
+          const allHops = data.one_hop_routes || [];
 
-                // Apply airline filter: show routes where ANY leg matches that airline
-                const hops = allHops.filter(hop => {
-                    if (!activeAirlineFilter) return true;
-                    const first  = hop.first_leg  || {};
-                    const second = hop.second_leg || {};
-                    const c1 = getAirlineCodeFromObj(first.airline || {});
-                    const c2 = getAirlineCodeFromObj(second.airline || {});
-                    return c1 === activeAirlineFilter || c2 === activeAirlineFilter;
-                });
+          // Start from all hops
+          let hops = allHops;
 
-                if (!hops.length) {
-                    const msg = activeAirlineFilter
-                        ? "No one-hop routes for " + activeAirlineFilter +
-                          " on this city pair. Try another airline or 'All airlines'."
-                        : "No one-hop routes found between " +
-                          (src.iata || "???") + " and " + (dst.iata || "???") + ".";
-                    resultsList.innerHTML = '<p class="no-results">' + msg + '</p>';
-                    return;
-                }
+          // 1) Apply airline filter first (so airports only show where that airline flies)
+          if (activeAirlineFilter) {
+            hops = hops.filter(hop => {
+              const first  = hop.first_leg  || {};
+              const second = hop.second_leg || {};
+              const c1 = getAirlineCodeFromObj(first.airline  || {});
+              const c2 = getAirlineCodeFromObj(second.airline || {});
+              return c1 === activeAirlineFilter || c2 === activeAirlineFilter;
+            });
+          }
 
-                hops.forEach(function (hop) {
-                    const via    = hop.via;
-                    const first  = hop.first_leg || {};
-                    const second = hop.second_leg || {};
+          // 2) Then apply layover filter (if any)
+          if (activeLayoverFilter) {
+            hops = hops.filter(hop => {
+              const via = getViaAirportFromHop(hop);
+              const viaCode = (via && (via.iata || via.icao)) || "";
+              return viaCode === activeLayoverFilter;
+            });
+          }
 
-                    const sameAirline  = !!hop.same_airline;
-                    const hasCodeshare = !!hop.has_codeshare;
-                    const distance     = hop.total_distance_miles.toFixed(0);
+          // 3) Rebuild BOTH chip bars from the final subset of hops
+          renderLayoverFilterBar(data, hops);           // airports only where current airline flies
+          renderAirlineFilterBar("onehop", data, hops); // airlines that still exist with current layover
 
-                    const firstAirlinePill  = createAirlinePill(first.airline  || {});
-                    const secondAirlinePill = createAirlinePill(second.airline || {});
+          // 4) Map + "no results" handling
+          renderRoutesOnHomeMap("onehop", data, hops);
 
-                    // compute equipment labels here, where they’re needed
-                    const firstEquipLabel  = formatEquipment(first.equipment  || "");
-                    const secondEquipLabel = formatEquipment(second.equipment || "");
+          if (!hops.length) {
+            const baseMsg = "No one-hop routes found between " +
+              (src.iata || "???") + " and " + (dst.iata || "???") + ".";
+            resultsList.innerHTML =
+              '<p class="no-results">' + baseMsg + '</p>';
+            clearHomeMap();
+            return;
+          }
 
-                    let badgesHtml = "";
-                    if (sameAirline) {
-                        badgesHtml += '<span class="route-tag same-airline">Same airline both legs</span>';
-                    } else {
-                        badgesHtml += '<span class="route-tag mixed-airlines">Mixed airlines</span>';
-                    }
-                    if (hasCodeshare) {
-                        badgesHtml += '<span class="route-tag codeshare">Codeshare on one or more legs</span>';
-                    }
+          // 5) Build the cards from `hops`
+          hops.forEach(function (hop, index) {
+            const via    = getViaAirportFromHop(hop);  // <— use helper so via is always found
+            const first  = hop.first_leg || {};
+            const second = hop.second_leg || {};
 
-                    const card = document.createElement("div");
-                    card.className = "route-card";
-                    card.innerHTML =
-                        '<div class="route-main-line">' +
-                            '<span class="route-city">' + src.city + ' (' + src.iata + ')</span>' +
-                            '<span class="route-arrow">→</span>' +
-                            '<span class="route-city">' + dst.city + ' (' + dst.iata + ')</span>' +
-                            '<span class="route-tag onehop">1 stop via ' +
-                                via.city + ' (' + via.iata + ')</span>' +
-                            '<span class="route-distance">' + distance + ' mi</span>' +
-                        '</div>' +
-                        '<div class="route-sub-line">' +
-                            badgesHtml +
-                        '</div>' +
-                        '<div class="route-sub-line" style="gap: 1rem;">' +
-                          '<span style="display:flex;align-items:center;gap:0.25rem;">' +
-                            '1st leg: <span class="__first-pill-slot"></span>' +
-                            (firstEquipLabel ? ' · <span>Aircraft: ' + firstEquipLabel + '</span>' : '') +
-                          '</span>' +
-                          '<span style="display:flex;align-items:center;gap:0.25rem;">' +
-                            '2nd leg: <span class="__second-pill-slot"></span>' +
-                            (secondEquipLabel ? ' · <span>Aircraft: ' + secondEquipLabel + '</span>' : '') +
-                          '</span>' +
-                        '</div>';
+            const sameAirline  = !!hop.same_airline;
+            const hasCodeshare = !!hop.has_codeshare;
+            const distance     = hop.total_distance_miles.toFixed(0);
 
-                    resultsList.appendChild(card);
-                    card.querySelector(".__first-pill-slot").replaceWith(firstAirlinePill);
-                    card.querySelector(".__second-pill-slot").replaceWith(secondAirlinePill);
-                });
+            const firstAirlinePill  = createAirlinePill(first.airline  || {});
+            const secondAirlinePill = createAirlinePill(second.airline || {});
+
+            const firstEquipLabel  = formatEquipment(first.equipment  || "");
+            const secondEquipLabel = formatEquipment(second.equipment || "");
+
+            let badgesHtml = "";
+            if (sameAirline) {
+              badgesHtml += '<span class="route-tag same-airline">Same airline both legs</span>';
+            } else {
+              badgesHtml += '<span class="route-tag mixed-airlines">Mixed airlines</span>';
             }
+            if (hasCodeshare) {
+              badgesHtml += '<span class="route-tag codeshare">Codeshare on one or more legs</span>';
+            }
+
+            const card = document.createElement("div");
+            card.className = "route-card clickable";
+            card.dataset.routeId = 'onehop-' + index;
+            card.addEventListener('click', () => {
+              highlightRoute(card.dataset.routeId);
+            });
+
+            card.innerHTML =
+              '<div class="route-main-line">' +
+                '<span class="route-city">' + src.city + ' (' + src.iata + ')</span>' +
+                '<span class="route-arrow">→</span>' +
+                '<span class="route-city">' + dst.city + ' (' + dst.iata + ')</span>' +
+                '<span class="route-tag onehop">1 stop via ' +
+                  (via ? (via.city + ' (' + (via.iata || via.icao || '') + ')') : '—') +
+                '</span>' +
+                '<span class="route-distance">' + distance + ' mi</span>' +
+              '</div>' +
+              '<div class="route-sub-line">' +
+                badgesHtml +
+              '</div>' +
+              '<div class="route-sub-line" style="gap: 1rem;">' +
+                '<span style="display:flex;align-items:center;gap:0.25rem;">' +
+                  '1st leg: <span class="__first-pill-slot"></span>' +
+                  (firstEquipLabel ? ' · <span>Aircraft: ' + firstEquipLabel + '</span>' : '') +
+                '</span>' +
+                '<span style="display:flex;align-items:center;gap:0.25rem;">' +
+                  '2nd leg: <span class="__second-pill-slot"></span>' +
+                  (secondEquipLabel ? ' · <span>Aircraft: ' + secondEquipLabel + '</span>' : '') +
+                '</span>' +
+              '</div>';
+
+            resultsList.appendChild(card);
+            card.querySelector(".__first-pill-slot").replaceWith(firstAirlinePill);
+            card.querySelector(".__second-pill-slot").replaceWith(secondAirlinePill);
+          });
+        }
         function renderForCurrentMode() {
             if (viewMode === "json") {
                 renderJsonView();
@@ -2185,27 +2806,27 @@ int main() {
         
         function renderJsonView() {
             clearResults();
-
+        
             if (!lastMode) {
                 resultsList.innerHTML =
                     '<p class="no-results">(run a search to see JSON)</p>';
                 return;
             }
-
+        
             const data = (lastMode === "direct") ? lastDirectData : lastOneHopData;
             if (!data) {
                 resultsList.innerHTML =
                     '<p class="no-results">(no data available yet)</p>';
                 return;
             }
-
+        
             // Show raw JSON, pretty-printed; basic escaping of "<"
             const jsonStr = JSON.stringify(data, null, 2).replace(/</g, "&lt;");
-
+        
             // We can keep the airline filter bar, or clear it; your choice.
             // For now, clear filters so the JSON area has more room:
             airlineFilters.innerHTML = "";
-
+        
             resultsList.innerHTML =
                 '<pre style="background:#020617;color:#e5e7eb;' +
                 'padding:0.75rem;border-radius:0.5rem;font-size:0.8rem;' +
@@ -2213,12 +2834,12 @@ int main() {
                 jsonStr +
                 '</pre>';
         }
-
+        
          // --- Autocomplete helpers ---
-
+        
                     let activeList = null;
                     let activeIndex = -1;
-
+        
                     async function fetchAirportSuggestions(query) {
                         if (!query || query.length < 2) return [];
                         try {
@@ -2230,37 +2851,37 @@ int main() {
                             return [];
                         }
                     }
-
+        
                     function renderSuggestions(airports, inputEl, listEl) {
                         listEl.innerHTML = "";
                         activeList = listEl;
                         activeIndex = -1;
-
+        
                         if (!airports.length) {
                             listEl.innerHTML = '<div class="autocomplete-empty">No matching airports</div>';
                             listEl.style.display = "block";
                             return;
                         }
-
+        
                         airports.forEach((ap, idx) => {
                             const div = document.createElement("div");
                             div.className = "autocomplete-item";
                             const display = ap.display || (ap.city + ", " + ap.country + " (" + ap.code + ")");
                             div.textContent = display;
                             div.dataset.code = ap.code;
-
+        
                             div.addEventListener("click", () => {
                                 inputEl.value = display;
                                 listEl.style.display = "none";
                                 listEl.innerHTML = "";
                             });
-
+        
                             listEl.appendChild(div);
                         });
-
+        
                         listEl.style.display = "block";
                     }
-
+        
                     async function handleAutocompleteInput(inputEl, listEl) {
                         const query = (inputEl.value || "").trim();
                         if (query.length < 2) {
@@ -2274,13 +2895,13 @@ int main() {
                             renderSuggestions(airports, inputEl, listEl);
                         }
                     }
-
+        
                     function handleAutocompleteKeydown(e, inputEl, listEl) {
                         if (listEl.style.display === "none") return;
-
+        
                         const items = listEl.querySelectorAll(".autocomplete-item");
                         if (!items.length) return;
-
+        
                         if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                             e.preventDefault();
                             if (activeList !== listEl) {
@@ -2308,14 +2929,14 @@ int main() {
                     dstInput.addEventListener("input", () => {
                         handleAutocompleteInput(dstInput, dstSuggestions);
                     });
-
+        
                     srcInput.addEventListener("keydown", (e) => {
                         handleAutocompleteKeydown(e, srcInput, srcSuggestions);
                     });
                     dstInput.addEventListener("keydown", (e) => {
                         handleAutocompleteKeydown(e, dstInput, dstSuggestions);
                     });
-
+        
                     // Hide suggestions when clicking outside
                     document.addEventListener("click", (e) => {
                         if (!e.target.closest(".autocomplete-container")) {
@@ -2323,11 +2944,29 @@ int main() {
                             dstSuggestions.style.display = "none";
                         }
                     });
+                    // Clear Filters button: reset airline + layover filters and re-render
+                    clearFiltersBtn.addEventListener("click", () => {
+                        activeAirlineFilter = null;
+                        activeLayoverFilter = null;
+                        renderLastResults();
+                    });
             // ----- Network calls -----
         
             form.addEventListener("submit", function (event) {
+                
                 event.preventDefault();
                 setError("");
+                
+                // 🔄 Reset airline filter whenever a new search is run
+                  activeAirlineFilter = null;
+                  airlineFilters.innerHTML = ""; // optional, it'll be repopulated by render
+        
+                activeLayoverFilter = null;
+                layoverFilters.innerHTML = "";
+                
+                errorEl.textContent = "";
+                  resultsList.innerHTML = '<p class="no-results">Loading...</p>';
+
         
                 const pair = getSrcDstOrError();
                 if (!pair) return;
@@ -2349,6 +2988,8 @@ int main() {
                 });
         
                 clearResults();
+                clearHomeMap(); // Clear map and previous highlight
+
                 resultsList.innerHTML = '<p class="no-results">Loading one-hop routes…</p>';
         
                 fetch("/onehop?" + params.toString())
@@ -2389,6 +3030,7 @@ int main() {
                 });
         
                 clearResults();
+                clearHomeMap(); // Clear map and previous highlight
                 resultsList.innerHTML = '<p class="no-results">Loading non-stop routes…</p>';
         
                 fetch("/direct?" + params.toString())
@@ -2408,7 +3050,7 @@ int main() {
                         }
                         viewMode = "cards";
                         updateViewModeTabs();
-
+        
                         renderNonstopResults(data);
                     })
                     .catch(function (err) {
@@ -2417,7 +3059,7 @@ int main() {
                         clearResults();
                     });
             });
-       
+        
         })();
         </script>
         </body>
@@ -2470,6 +3112,12 @@ int main() {
           <title>Airline Routes Explorer</title>
           <meta name="viewport" content="width=device-width, initial-scale=1" />
           <style>
+            /* NEW: Map container style */
+                #routeMap {
+                  height: 400px; /* Define the height for the map */
+                  margin-top: 1rem;
+                  border-radius: 8px;
+                }
             body {
               font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
               margin: 0;
@@ -2636,6 +3284,21 @@ int main() {
               border-radius: 999px;
               font-weight: 500;
             }
+        .clear-filters-btn {
+            background: #e5e7eb;
+            color: #374151;
+            border: none;
+            border-radius: 999px;
+            padding: 0.25rem 0.8rem;
+            font-size: 0.78rem;
+            font-weight: 500;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .clear-filters-btn:hover {
+            background: #d1d5db;
+        }
             .view-tab.active {
               background: #111827;
               color: #f9fafb;
@@ -2654,7 +3317,7 @@ int main() {
               white-space: nowrap;
               line-height: 1;
             }
-
+        
             .airline-pill img {
               height: 1.25rem;
               width: 1.25rem;
@@ -2681,7 +3344,7 @@ int main() {
                 <a href="/">← Back to Route Finder</a>
               </div>
             </div>
-
+        
             <form id="airline-form">
               <div class="field-group">
                 <div class="field autocomplete-container" style="max-width: 220px;">
@@ -2703,19 +3366,20 @@ int main() {
                 Uses the <code>/airline/routes?code=XX</code> API from the server.
               </div>
             </form>
-
+        
             <h3>Results</h3>
+            <div id="routeMap"></div>
 
             <div class="view-mode-tabs" id="viewModeTabs">
               <button class="view-tab active" data-mode="cards">Cards</button>
               <button class="view-tab" data-mode="json">JSON</button>
             </div>
-
+        
             <div id="resultsList" class="results-list">
               <p class="no-results">(no results yet)</p>
             </div>
           </div>
-
+        <script src="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js"></script>
           <script>
             (function () {
               const form = document.getElementById("airline-form");
@@ -2723,23 +3387,45 @@ int main() {
               const limitInput = document.getElementById("limit");
               const errorEl = document.getElementById("error");
               const resultsList = document.getElementById("resultsList");
+        
+                // --- Mapbox Setup ---
+                            // IMPORTANT: Replace this with your actual public access token.
+                            mapboxgl.accessToken = 'pk.eyJ1IjoiY2hyaXN0aW5lcnlhbjkzIiwiYSI6ImNtaWJnZDhiMDAxN2sya29sNXZvNHExMXkifQ.6K3wdjmIhFRQD3bre4f_DA';
 
+                            const INITIAL_CENTER = [-98.5, 39.8]; // Center of the US (approx)
+                            const INITIAL_ZOOM = 2; // World view
+
+                            const map = new mapboxgl.Map({
+                                container: 'routeMap',
+                                style: 'mapbox://styles/mapbox/light-v11', // Light theme style
+                                center: INITIAL_CENTER,
+                                zoom: INITIAL_ZOOM
+                            });
+                            
+                            // Map state to be used later
+                            let routeMapIsLoaded = false; 
+
+                            map.on('load', () => {
+                                routeMapIsLoaded = true;
+                                // We'll add the map source and layer here once data is ready.
+                            });
+                            // --- End Mapbox Setup ---
               const viewModeTabs = document.getElementById("viewModeTabs");
               const viewTabButtons = viewModeTabs.querySelectorAll(".view-tab");
-
+        
               let viewMode = "cards";      // "cards" | "json"
               let lastData = null;         // last JSON from /airline/routes
               let lastTotalAirports = 0;   // <-- total airports before client-side limiting
             const airlineSuggestions = document.getElementById("airline-suggestions");
-
+        
             // Cache of all airlines from /airlines
             let allAirlines = null;
             let activeSuggestionIndex = -1;
-
+        
             // Load all airlines once (IATA non-empty, sorted by IATA)
             function loadAllAirlinesOnce() {
               if (allAirlines) return Promise.resolve(allAirlines);
-
+        
               return fetch("/airlines?limit=5000&offset=0")
                 .then(resp => {
                   if (!resp.ok) throw new Error("Failed to load airline list");
@@ -2756,7 +3442,7 @@ int main() {
                   return allAirlines;
                 });
             }
-
+        
             // Build a display label like "American Airlines (AA)"
             function airlineDisplayLabel(a) {
               const code = a.iata || a.icao || "";
@@ -2767,14 +3453,14 @@ int main() {
             function renderAirlineSuggestions(list) {
               airlineSuggestions.innerHTML = "";
               activeSuggestionIndex = -1;
-
+        
               if (!list.length) {
                 airlineSuggestions.innerHTML =
                   '<div class="autocomplete-empty">No matching airlines</div>';
                 airlineSuggestions.style.display = "block";
                 return;
               }
-
+        
               list.forEach((a, idx) => {
                 const div = document.createElement("div");
                 div.className = "autocomplete-item";
@@ -2782,56 +3468,56 @@ int main() {
                 div.textContent = label;
                 div.dataset.code = a.iata || a.icao || "";
                 div.dataset.label = label;
-
+        
                 div.addEventListener("click", () => {
                   airlineInput.value = label;
                   airlineSuggestions.style.display = "none";
                   airlineSuggestions.innerHTML = "";
                 });
-
+        
                 airlineSuggestions.appendChild(div);
               });
-
+        
               airlineSuggestions.style.display = "block";
             }
-
+        
             function filterAirlines(query) {
               if (!allAirlines || !allAirlines.length) return [];
-
+        
               const q = query.trim().toLowerCase();
               if (!q) return [];
-
+        
               // Simple scoring: prioritize IATA prefix, then name matches
               const scored = allAirlines.map(a => {
                 const code = (a.iata || a.icao || "").toLowerCase();
                 const name = (a.name || "").toLowerCase();
                 const country = (a.country || "").toLowerCase();
-
+        
                 let score = 0;
-
+        
                 if (code === q) score += 200;
                 else if (code.startsWith(q)) score += 140;
                 else if (code.includes(q)) score += 60;
-
+        
                 if (name === q) score += 180;
                 else if (name.startsWith(q)) score += 140;
                 else if (name.includes(q)) score += 80;
-
+        
                 if (country.includes(q)) score += 10;
-
+        
                 return { airline: a, score };
               }).filter(x => x.score > 0);
-
+        
               scored.sort((a, b) => {
                 if (a.score !== b.score) return b.score - a.score;
                 const la = airlineDisplayLabel(a.airline);
                 const lb = airlineDisplayLabel(b.airline);
                 return la.localeCompare(lb);
               });
-
+        
               return scored.slice(0, 8).map(x => x.airline);
             }
-
+        
             function handleAirlineAutocompleteInput() {
               const query = airlineInput.value || "";
               if (query.trim().length < 2) {
@@ -2839,25 +3525,25 @@ int main() {
                 airlineSuggestions.innerHTML = "";
                 return;
               }
-
+        
               loadAllAirlinesOnce().then(() => {
                 const list = filterAirlines(query);
                 renderAirlineSuggestions(list);
               });
             }
-
+        
             function handleAirlineAutocompleteKeydown(e) {
               if (airlineSuggestions.style.display === "none") return;
-
+        
               const items = airlineSuggestions.querySelectorAll(".autocomplete-item");
               if (!items.length) return;
-
+        
               if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                 e.preventDefault();
                 const dir = (e.key === "ArrowDown") ? 1 : -1;
                 activeSuggestionIndex =
                   (activeSuggestionIndex + dir + items.length) % items.length;
-
+        
                 items.forEach(el => el.classList.remove("active"));
                 items[activeSuggestionIndex].classList.add("active");
                 items[activeSuggestionIndex].scrollIntoView({ block: "nearest" });
@@ -2879,15 +3565,15 @@ int main() {
               // Kiwi pattern for airline logos by IATA code
               return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
             }
-
+        
             function createAirlinePill(airlineObj) {
               const code = airlineObj.iata || airlineObj.icao || airlineObj.code || "";
               const name = airlineObj.name || (code ? code : "Unknown airline");
               const label = code ? (name + " (" + code + ")") : name;
-
+        
               const pill = document.createElement("span");
               pill.className = "airline-pill";
-
+        
               const logo = document.createElement("img");
               logo.src = getAirlineLogoUrl(code);
               logo.alt = label + " logo";
@@ -2895,7 +3581,7 @@ int main() {
                 // hide the broken image if logo is missing
                 this.style.display = "none";
               };
-
+        
               pill.appendChild(logo);
               pill.appendChild(document.createTextNode(label));
               return pill;
@@ -2904,11 +3590,71 @@ int main() {
               function setError(msg) {
                 errorEl.textContent = msg || "";
               }
-
+        
               function clearResults() {
                 resultsList.innerHTML = "";
               }
+        // Helper: Remove Existing Layer - NOW HARDENED
+            function clearMapRoutes() {
+                if (!routeMapIsLoaded) return;
+                
+                // 🔸 HARDENING: Check if layer and source exist before removal.
+                if (map.getLayer('routes-line')) {
+                    map.removeLayer('routes-line');
+                }
+                if (map.getSource('airline-routes')) {
+                    map.removeSource('airline-routes');
+                }
+            }
+        function renderMapRoutes(geoJsonData) {
+                        clearMapRoutes(); // Always clear previous routes first
+                        
+                        if (!routeMapIsLoaded || !geoJsonData.features || geoJsonData.features.length === 0) {
+                            // Map is not ready or no routes to draw
+                            return; 
+                        }
 
+                        // 1. Add the GeoJSON data as a new source
+                        map.addSource('airline-routes', {
+                            'type': 'geojson',
+                            'data': geoJsonData
+                        });
+
+                        // 2. Add a layer to display the lines
+                        map.addLayer({
+                            'id': 'routes-line',
+                            'type': 'line',
+                            'source': 'airline-routes',
+                            'layout': {
+                                'line-join': 'round',
+                                'line-cap': 'round'
+                            },
+                            'paint': {
+                                'line-color': '#2563eb', // Primary blue color
+                                'line-width': 1.5,
+                                'line-opacity': 0.7
+                            }
+                        });
+
+                        // 3. Zoom to fit the new routes (optional but highly recommended)
+                        const coordinates = geoJsonData.features.flatMap(f => f.geometry.coordinates);
+                        if (coordinates.length > 0) {
+                            const bounds = new mapboxgl.LngLatBounds();
+                            coordinates.forEach(coord => {
+                                // GeoJSON is [lon, lat], Mapbox expects LngLat
+                                bounds.extend(coord);
+                            });
+                            map.fitBounds(bounds, {
+                                padding: 20, // Padding around the lines
+                                maxZoom: 6,  // Don't zoom in too close
+                                duration: 1000 // Smooth animation
+                            });
+                        } else {
+                            // If no routes, reset to world view
+                            map.flyTo({ center: INITIAL_CENTER, zoom: INITIAL_ZOOM });
+                        }
+                    }
+        
               function updateViewTabs() {
                 viewTabButtons.forEach(btn => {
                   const mode = btn.getAttribute("data-mode");
@@ -2916,7 +3662,7 @@ int main() {
                   else btn.classList.remove("active");
                 });
               }
-
+        
               viewTabButtons.forEach(btn => {
                 btn.addEventListener("click", () => {
                   const mode = btn.getAttribute("data-mode");
@@ -2926,35 +3672,35 @@ int main() {
                   renderForCurrentMode();
                 });
               });
-
+        
               function renderCards(data) {
                 clearResults();
-
+        
                 if (!data || !data.airline) {
                   resultsList.innerHTML =
                     '<p class="no-results">No results to display yet.</p>';
                   return;
                 }
-
+        
                 const airline = data.airline;
                 const airports = data.airports || [];
                 const totalInDataset =
                   (typeof lastTotalAirports === "number" && lastTotalAirports > 0)
                     ? lastTotalAirports
                     : airports.length;
-
+        
                 if (!airports.length) {
                   resultsList.innerHTML =
                     '<p class="no-results">This airline has no routes in the dataset.</p>';
                   return;
                 }
-
+        
                 // Airline summary card at top, with logo pill
                 const summary = document.createElement("div");
                 summary.className = "route-card";
-
+        
                 const code = airline.iata || airline.icao || "";
-
+        
                 // build top line with a placeholder span we’ll replace with the pill
                 summary.innerHTML =
                   '<div class="route-main-line">' +
@@ -2964,7 +3710,7 @@ int main() {
                     (airline.country ? '<span>Country: ' + airline.country + '</span>' : '') +
                     '<span>Total airports in dataset: ' + totalInDataset + '</span>' +
                   '</div>';
-
+        
                 // create pill and insert it
                 const pill = createAirlinePill({
                   name: airline.name,
@@ -2973,18 +3719,18 @@ int main() {
                   code: code
                 });
                 summary.querySelector(".__airline-pill-slot").replaceWith(pill);
-
+        
                 resultsList.appendChild(summary);
-
+        
                 // One card per airport
                 airports.forEach(function (entry) {
                   const ap = entry.airport || {};
                   const count = entry.routes || 0;
-
+        
                   const city = ap.city || "";
                   const country = ap.country || "";
                   const iata = ap.iata || ap.icao || "???";
-
+        
                   const card = document.createElement("div");
                   card.className = "route-card";
                   card.innerHTML =
@@ -2999,22 +3745,22 @@ int main() {
                     '<div class="route-sub-line">' +
                       (country ? '<span>' + country + '</span>' : '') +
                     '</div>';
-
+        
                   resultsList.appendChild(card);
                 });
               }
-
+        
               function renderJson() {
                 clearResults();
-
+        
                 if (!lastData) {
                   resultsList.innerHTML =
                     '<p class="no-results">(run a search to see JSON)</p>';
                   return;
                 }
-
+        
                 const jsonStr = JSON.stringify(lastData, null, 2).replace(/</g, "&lt;");
-
+        
                 resultsList.innerHTML =
                   '<pre style="background:#020617;color:#e5e7eb;' +
                   'padding:0.75rem;border-radius:0.5rem;font-size:0.8rem;' +
@@ -3022,7 +3768,7 @@ int main() {
                   jsonStr +
                   '</pre>';
               }
-
+        
               function renderForCurrentMode() {
                 if (viewMode === "json") renderJson();
                 else renderCards(lastData);
@@ -3030,24 +3776,24 @@ int main() {
             // Wire autocomplete to the input
             airlineInput.addEventListener("input", handleAirlineAutocompleteInput);
             airlineInput.addEventListener("keydown", handleAirlineAutocompleteKeydown);
-
+        
             // Hide suggestions when clicking outside
             document.addEventListener("click", (e) => {
               if (!e.target.closest(".autocomplete-container")) {
                 airlineSuggestions.style.display = "none";
               }
             });
-
+        
               form.addEventListener("submit", function (e) {
                 e.preventDefault();
                 setError("");
-
+        
                 let raw = (airlineInput.value || "").trim();
                 if (!raw) {
                   setError("Please enter an airline (e.g. AA, DL, UA or 'American').");
                   return;
                 }
-
+        
                 // If the user picked "American Airlines (AA)", extract AA from parentheses
                 let m = raw.match(/\(([A-Z0-9]{2,3})\)\s*$/i);
                 let code;
@@ -3058,66 +3804,77 @@ int main() {
                   const parts = raw.toUpperCase().split(/\s+/);
                   code = parts[0];
                 }
-
+        
                 let limit = parseInt((limitInput.value || "").trim(), 10);
                 if (isNaN(limit) || limit <= 0) {
                   limit = 50;
                   limitInput.value = "50";
                 }
-
+        
                 clearResults();
-                resultsList.innerHTML =
-                  '<p class="no-results">Loading airline routes…</p>';
+                                clearMapRoutes(); // NEW: Clear the map on new search
+                                
+                                resultsList.innerHTML = '<p class="no-results">Loading airline routes…</p>';
 
-                fetch("/airline/routes?code=" + encodeURIComponent(code))
-                  .then(resp => {
-                    if (!resp.ok) {
-                      return resp.text().then(text => {
-                        throw new Error("Server returned " + resp.status + ": " + text);
-                      });
-                    }
-                    return resp.json();
-                  })
-                  .then(data => {
-                    if (data && typeof data === "object" && data.error) {
-                      setError("Server error: " + data.error);
-                      clearResults();
-                      return;
-                    }
+                                // 1. Fetch JSON for CARD VIEW (existing endpoint)
+                                const cardDataPromise = fetch("/airline/routes?code=" + encodeURIComponent(code))
+                                    .then(resp => {
+                                        if (!resp.ok) {
+                                            return resp.text().then(text => { throw new Error("Card data failed: " + resp.status + ": " + text); });
+                                        }
+                                        return resp.json();
+                                    });
 
-                    // 1) Remember the true total from the server
-                      if (Array.isArray(data.airports)) {
-                        lastTotalAirports = data.airports.length;
-                      } else {
-                        lastTotalAirports = 0;
-                      }
+                                // 2. Fetch GeoJSON for MAP VIEW (new endpoint)
+                                const geoJsonPromise = fetch("/api/routes/geojson?airline=" + encodeURIComponent(code))
+                                    .then(resp => {
+                                        if (!resp.ok) {
+                                            // If GeoJSON fails, it's not a fatal error, but we log it.
+                                            console.warn("GeoJSON fetch failed:", resp.status);
+                                            return { features: [] }; // return empty GeoJSON
+                                        }
+                                        return resp.json();
+                                    });
 
-                      // 2) Optionally apply a client-side limit on airports
-                      if (Array.isArray(data.airports) && data.airports.length > limit) {
-                        data = Object.assign({}, data, {
-                          airports: data.airports.slice(0, limit)
-                        });
-                      }
+                                // 3. Process both in parallel
+                                Promise.all([cardDataPromise, geoJsonPromise])
+                                    .then(([cardData, geoJsonData]) => {
+                                        if (cardData && typeof cardData === "object" && cardData.error) {
+                                            setError("Server error: " + cardData.error);
+                                            clearResults();
+                                            return;
+                                        }
 
-                      lastData = data;
-                      viewMode = "cards";
-                      updateViewTabs();
-                      renderCards(data);
-                    })
-                  .catch(err => {
-                    console.error(err);
-                    setError("Request failed. Please try again.");
-                    clearResults();
-                  });
-              });
+                                        // A. Render the map first
+                                        renderMapRoutes(geoJsonData);
+                                        
+                                        // B. Render the cards (existing logic)
+                                        const airlinesArr = Array.isArray(cardData.airports) ? cardData.airports : [];
+                                        lastTotalAirports = airlinesArr.length;
+                                        let limitedAirports = airlinesArr;
+                                        if (airlinesArr.length > limit) {
+                                          limitedAirports = airlinesArr.slice(0, limit);
+                                        }
+                                        lastData = Object.assign({}, cardData, { airports: limitedAirports });
+                                        
+                                        viewMode = "cards";
+                                        updateViewTabs();
+                                        renderCards(lastData);
+                                    })
+                                    .catch(err => {
+                                        console.error(err);
+                                        setError("Request failed. Please check the console.");
+                                        clearResults();
+                                    });
+                            });
             })();
           </script>
         </body>
         </html>
         )HTML";
             
-        
-
+            
+            
             response = buildHttpResponse(body, "text/html; charset=UTF-8");
         }
         
@@ -3129,6 +3886,7 @@ int main() {
               <meta charset="UTF-8" />
               <title>Airport Airlines Explorer</title>
               <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet" />
               <style>
                 body {
                   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -3280,7 +4038,7 @@ int main() {
                   font-size: 0.9rem;
                   color: #6b7280;
                 }
-
+            
                 .view-mode-tabs {
                   display: inline-flex;
                   gap: 0.25rem;
@@ -3301,7 +4059,7 @@ int main() {
                   background: #111827;
                   color: #f9fafb;
                 }
-
+            
             /* Shaded airline pill (same as airline-ui) */
             .airline-pill {
               display: inline-flex;
@@ -3316,7 +4074,7 @@ int main() {
               white-space: nowrap;
               line-height: 1;
             }
-
+            
             .airline-pill img {
               height: 1.25rem;
               width: 1.25rem;
@@ -3341,7 +4099,7 @@ int main() {
               background: #4f46e5;
               color: #f9fafb;
             }
-
+            
             .airline-pill-name {
               white-space: nowrap;
             }
@@ -3357,14 +4115,14 @@ int main() {
               gap: 0.15rem;
               font-size: 0.9rem;
             }
-
+            
             .route-main-line {
               display: flex;
               align-items: center;
               justify-content: space-between;
               gap: 0.75rem;
             }
-
+            
             .route-tag {
               font-size: 0.78rem;
               font-weight: 600;
@@ -3374,7 +4132,7 @@ int main() {
               color: #f9fafb;
               white-space: nowrap;
             }
-
+            
             .route-sub-line {
               font-size: 0.82rem;
               color: #4b5563;
@@ -3396,7 +4154,7 @@ int main() {
                     <a href="/">← Back to Route Finder</a>
                   </div>
                 </div>
-
+            
                 <form id="airport-form">
                   <div class="field-group">
                     <div class="field" style="max-width: 260px;">
@@ -3436,19 +4194,19 @@ int main() {
                     Uses the <code>/airport/routes?code=XX</code> API from the server.
                   </div>
                 </form>
-
+            
                 <h3>Results</h3>
-
+            
                 <div class="view-mode-tabs" id="viewModeTabs">
                   <button class="view-tab active" data-mode="cards">Cards</button>
                   <button class="view-tab" data-mode="json">JSON</button>
                 </div>
-
+            
                 <div id="resultsList" class="results-list">
                   <p class="no-results">(no results yet)</p>
                 </div>
               </div>
-
+            
               <script>
                 (function () {
                   const form = document.getElementById("airport-form");
@@ -3456,22 +4214,22 @@ int main() {
                   const limitInput = document.getElementById("limit");
                   const errorEl = document.getElementById("error");
                   const resultsList = document.getElementById("resultsList");
-
+            
                   const viewModeTabs = document.getElementById("viewModeTabs");
                   const viewTabButtons = viewModeTabs.querySelectorAll(".view-tab");
-
+            
                   let viewMode = "cards";   // "cards" | "json"
                   let lastData = null;      // last JSON from /airport/routes
                   let lastTotalAirlines = 0;
-
+            
                   function setError(msg) {
                     errorEl.textContent = msg || "";
                   }
-
+            
                   function clearResults() {
                     resultsList.innerHTML = "";
                   }
-
+            
                   function updateViewTabs() {
                     viewTabButtons.forEach(btn => {
                       const mode = btn.getAttribute("data-mode");
@@ -3479,7 +4237,7 @@ int main() {
                       else btn.classList.remove("active");
                     });
                   }
-
+            
                   viewTabButtons.forEach(btn => {
                     btn.addEventListener("click", () => {
                       const mode = btn.getAttribute("data-mode");
@@ -3489,7 +4247,7 @@ int main() {
                       renderForCurrentMode();
                     });
                   });
-
+            
                   
             // --- Airline logo + pill helpers (same behavior as airline-ui) ---
             function getAirlineLogoUrl(code) {
@@ -3500,21 +4258,21 @@ int main() {
               // Kiwi pattern for airline logos by IATA code
               return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
             }
-
+            
             function airlineDisplayName(al) {
               if (!al) return "Unknown airline";
               const code = al.iata || al.icao || al.code || "";
               const base = al.name || code || "Unknown airline";
               return code ? base + " (" + code + ")" : base;
             }
-
+            
             function renderAirlinePillFromData(entry) {
               const al   = entry.airline || {};
               const code = al.iata || al.icao || al.code || "";
               const name = airlineDisplayName(al);
-
+            
               const logoUrl = code ? getAirlineLogoUrl(code) : "";
-
+            
               if (logoUrl) {
                 return (
                   '<span class="airline-pill">' +
@@ -3523,7 +4281,7 @@ int main() {
                   "</span>"
                 );
               }
-
+            
               const initial = (name || code || "?").charAt(0).toUpperCase();
               return (
                 '<span class="airline-pill">' +
@@ -3532,27 +4290,27 @@ int main() {
                 "</span>"
               );
             }
-
-        
+            
+            
             
                   function renderCards(data) {
                     clearResults();
-
+            
                     if (!data || !data.airport) {
                       resultsList.innerHTML =
                         '<p class="no-results">No results to display yet.</p>';
                       return;
                     }
-
+            
                     const airport = data.airport;
                     const airlines = data.airlines || [];
-
+            
                     if (!airlines.length) {
                       resultsList.innerHTML =
                         '<p class="no-results">No airlines in the dataset for this airport.</p>';
                       return;
                     }
-
+            
                     // Airport summary card
                     const summary = document.createElement("div");
                     summary.className = "card";
@@ -3560,7 +4318,7 @@ int main() {
                     const locBits = [];
                     if (airport.city) locBits.push(airport.city);
                     if (airport.country) locBits.push(airport.country);
-
+            
                     summary.innerHTML =
                       '<div class="main-line">' +
                         '<span class="name-text">' + (airport.name || "Unknown airport") + '</span>' +
@@ -3570,14 +4328,14 @@ int main() {
                         (locBits.length ? "<span>" + locBits.join(", ") + "</span>" : "") +
                         '<span>Total airlines in dataset: ' + lastTotalAirlines + "</span>" +
                       "</div>";
-
+            
                     resultsList.appendChild(summary);
-
+            
                     airlines.forEach(function (entry) {
                       const al = entry.airline || {};
                       const count = entry.routes || 0;
                       const country = al.country || "";
-
+            
                       const card = document.createElement("div");
                       card.className = "route-card";
                       card.innerHTML =
@@ -3588,24 +4346,24 @@ int main() {
                         '<div class="route-sub-line">' +
                           (country ? "<span>Country: " + country + "</span>" : "") +
                         "</div>";
-
+            
                       resultsList.appendChild(card);
                     });
                   }
-
+            
                   function renderJson() {
                     clearResults();
-
+            
                     if (!lastData) {
                       resultsList.innerHTML =
                         '<p class="no-results">(run a search to see JSON)</p>';
                       return;
                     }
-
+            
                     const jsonStr = JSON
                       .stringify(lastData, null, 2)
                       .replace(/</g, "&lt;");
-
+            
                     resultsList.innerHTML =
                       '<pre style="background:#020617;color:#e5e7eb;' +
                       'padding:0.75rem;border-radius:0.5rem;font-size:0.8rem;' +
@@ -3613,38 +4371,38 @@ int main() {
                       jsonStr +
                       "</pre>";
                   }
-
+            
                   function renderForCurrentMode() {
                     if (viewMode === "json") renderJson();
                     else renderCards(lastData);
                   }
-
+            
                   form.addEventListener("submit", function (e) {
                     e.preventDefault();
                     setError("");
-
+            
                     let code = (airportInput.value || "").trim().toUpperCase();
                     if (!code) {
                       setError("Please enter an airport code (e.g. SJC, JFK, ATL).");
                       return;
                     }
-
+            
                     // If user typed "SJC - San Jose", grab the first token
                     const parts = code.split(/\s+/);
                     if (parts.length > 1) {
                       code = parts[0];
                     }
-
+            
                     let limit = parseInt((limitInput.value || "").trim(), 10);
                     if (isNaN(limit) || limit <= 0) {
                       limit = 50;
                       limitInput.value = "50";
                     }
-
+            
                     clearResults();
                     resultsList.innerHTML =
                       '<p class="no-results">Loading airport airlines…</p>';
-
+            
                     fetch("/airport/routes?code=" + encodeURIComponent(code))
                       .then(resp => {
                         if (!resp.ok) {
@@ -3660,19 +4418,19 @@ int main() {
                           clearResults();
                           return;
                         }
-
+            
                         // Remember the total airline count BEFORE limiting
                         const airlinesArr = Array.isArray(data.airlines) ? data.airlines : [];
                         lastTotalAirlines = airlinesArr.length;
-
+            
                         // Apply client-side limit for display
                         let limitedAirlines = airlinesArr;
                         if (airlinesArr.length > limit) {
                           limitedAirlines = airlinesArr.slice(0, limit);
                         }
-
+            
                         lastData = Object.assign({}, data, { airlines: limitedAirlines });
-
+            
                         viewMode = "cards";
                         updateViewTabs();
                         renderCards(lastData);
@@ -3689,7 +4447,7 @@ int main() {
             </html>
             )HTML";
             response = buildHttpResponse(body, "text/html; charset=UTF-8");
-
+            
         }
         else if (pathOnly == "/airport") {
             // your existing /airport?code= handler:
@@ -3718,23 +4476,23 @@ int main() {
             }
         }
         else if (pathOnly == "/code") {
-                    // Adjust this filename if your source file is named differently.
+            // Adjust this filename if your source file is named differently.
             constexpr const char* SOURCE_FILE = "main.cpp";
             std::ifstream file(SOURCE_FILE);
-                    if (!file) {
-                        std::string body = "Could not open main.cpp on the server.";
-                        response = buildHttpResponse(
-                            body,
-                            "text/plain; charset=UTF-8",
-                            "HTTP/1.1 500 Internal Server Error\r\n"
-                        );
-                    } else {
-                        std::ostringstream buf;
-                        buf << file.rdbuf();
-                        std::string body = buf.str();
-                        response = buildHttpResponse(body, "text/plain; charset=UTF-8");
-                    }
-                }
+            if (!file) {
+                std::string body = "Could not open main.cpp on the server.";
+                response = buildHttpResponse(
+                                             body,
+                                             "text/plain; charset=UTF-8",
+                                             "HTTP/1.1 500 Internal Server Error\r\n"
+                                             );
+            } else {
+                std::ostringstream buf;
+                buf << file.rdbuf();
+                std::string body = buf.str();
+                response = buildHttpResponse(body, "text/plain; charset=UTF-8");
+            }
+        }
         else if (pathOnly == "/direct") {
             auto params = parseQueryString(queryString);
             
@@ -4044,6 +4802,57 @@ int main() {
             std::string body = airportsSearchToJson(q, limit);
             response = buildHttpResponse(body, "application/json; charset=UTF-8");
         }
+        // ... (existing handlers before this)
+        
+        else if (pathOnly == "/api/routes/geojson") {
+            auto params = parseQueryString(queryString);
+            auto it = params.find("airline");
+            
+            if (it == params.end() || it->second.empty()) {
+                std::string body = R"({"error":"Missing 'airline' query parameter"})";
+                response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                             "HTTP/1.1 400 Bad Request\r\n");
+            } else {
+                std::string code = it->second;
+                for (char &c : code) c = static_cast<char>(std::toupper((unsigned char)c));
+                
+                // 1. Find the Airline
+                const Airline *al = findAirlineByCode(code);
+                
+                if (!al || al->id == -1) {
+                    // Fallback: search by IATA/ICAO code if ID is missing (can be slow)
+                    std::vector<const Route*> routes;
+                    for(const auto &r : g_routes) {
+                        if (r.airline == code) {
+                            routes.push_back(&r);
+                        }
+                    }
+                    if (routes.empty()) {
+                        std::string body = R"({"error":"Airline not found or has no routes"})";
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 404 Not Found\r\n");
+                        
+                    } else {
+                        // Serve routes found via code fallback
+                        std::string body = routesToGeoJson(routes);
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                    }
+                    
+                } else {
+                    // 2. Use the fast index (O(1) lookup)
+                    auto itRoutes = g_routesByAirlineId.find(al->id);
+                    std::vector<const Route*> routes = (itRoutes != g_routesByAirlineId.end())
+                    ? itRoutes->second
+                    : std::vector<const Route*>();
+                    
+                    // 3. Generate GeoJSON
+                    std::string body = routesToGeoJson(routes);
+                    response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                }
+            }
+        }
+        
+        // ... (existing handlers after this)
         else if (pathOnly == "/id") {
             std::string body = R"({"name":"Christine Hatch","student_id":"20174104"})";
             response = buildHttpResponse(body, "application/json; charset=UTF-8");
@@ -4056,7 +4865,7 @@ int main() {
             if (it != params.end()) {
                 code = it->second;
             }
-
+            
             // Trim spaces and uppercase the code, e.g. "jfk" -> "JFK"
             auto trim = [](std::string &s) {
                 while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
@@ -4070,31 +4879,31 @@ int main() {
             for (char &ch : code) {
                 ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
             }
-
+            
             std::cerr << "[/airport/routes] code = '" << code << "'\n";
-
+            
             const Airport *ap = nullptr;
             auto itAp = g_airportsByIata.find(code);
             if (itAp != g_airportsByIata.end()) {
                 ap = itAp->second;
             }
-
+            
             std::string body;
             std::string statusLine = "HTTP/1.1 200 OK\r\n";
-
+            
             if (!ap) {
                 body = "{\"error\":\"Unknown airport code\"}";
                 statusLine = "HTTP/1.1 404 Not Found\r\n";
             } else {
                 body = airportAirlinesReportToJson(*ap);
             }
-
+            
             // Just set response; the send() happens once at the bottom with client_fd.
             response = buildHttpResponse(
-                body,
-                "application/json; charset=UTF-8",
-                statusLine
-            );
+                                         body,
+                                         "application/json; charset=UTF-8",
+                                         statusLine
+                                         );
         }
         else {
             std::string body =
