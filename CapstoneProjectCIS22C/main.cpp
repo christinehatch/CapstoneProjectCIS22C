@@ -951,6 +951,127 @@ const Airport* findAirportByIata(const std::string &code) {
     if (it == g_airportsByIata.end()) return nullptr;
     return it->second;
 }
+
+// ---------- Update helpers ----------
+
+// Rebuild airport IATA index after inserts / deletes / modifications.
+void rebuildAirportIndex() {
+    g_airportsByIata.clear();
+    for (const auto &a : g_airports) {
+        if (!a.iata.empty()) {
+            g_airportsByIata[a.iata] = &a;
+        }
+    }
+}
+
+// Rebuild airline IATA index after inserts / deletes / modifications.
+void rebuildAirlineIndex() {
+    g_airlinesByIata.clear();
+    for (const auto &al : g_airlines) {
+        if (!al.iata.empty()) {
+            g_airlinesByIata[al.iata] = &al;
+        }
+    }
+}
+
+// Rebuild all route indices after any change to g_routes.
+void rebuildRouteIndices() {
+    g_routesBySrcAirport.clear();
+    g_routesByDstAirport.clear();
+    g_routesByAirlineId.clear();
+
+    for (const auto &r : g_routes) {
+        if (!r.srcAirport.empty() && !isNullField(r.srcAirport)) {
+            g_routesBySrcAirport[r.srcAirport].push_back(&r);
+        }
+        if (!r.dstAirport.empty() && !isNullField(r.dstAirport)) {
+            g_routesByDstAirport[r.dstAirport].push_back(&r);
+        }
+        if (r.airlineId != -1) {
+            g_routesByAirlineId[r.airlineId].push_back(&r);
+        }
+    }
+}
+
+// Small helpers to find mutable indices by id.
+int findAirportIndexById(int id) {
+    for (std::size_t i = 0; i < g_airports.size(); ++i) {
+        if (g_airports[i].id == id) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+int findAirlineIndexById(int id) {
+    for (std::size_t i = 0; i < g_airlines.size(); ++i) {
+        if (g_airlines[i].id == id) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// Find route by (airline code, src, dst).
+// We keep this simple: use airline code (IATA/ICAO) + src/dst codes.
+int findRouteIndexByTriple(const std::string &airlineCode,
+                           const std::string &src,
+                           const std::string &dst) {
+    for (std::size_t i = 0; i < g_routes.size(); ++i) {
+        const Route &r = g_routes[i];
+        if (!airlineCode.empty() &&
+            !isNullField(r.airline) &&
+            r.airline == airlineCode &&
+            r.srcAirport == src &&
+            r.dstAirport == dst) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+std::string routeToJson(const Route &r) {
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"airline\":\""     << r.airline      << "\",";
+    oss << "\"airlineId\":"     << r.airlineId    << ",";
+    oss << "\"srcAirport\":\""  << r.srcAirport   << "\",";
+    oss << "\"srcAirportId\":"  << r.srcAirportId << ",";
+    oss << "\"dstAirport\":\""  << r.dstAirport   << "\",";
+    oss << "\"dstAirportId\":"  << r.dstAirportId << ",";
+    oss << "\"codeshare\":"     << (r.codeshare ? "true" : "false") << ",";
+    oss << "\"stops\":"         << r.stops        << ",";
+    oss << "\"equipment\":\""   << r.equipment    << "\"";
+    oss << "}";
+    return oss.str();
+}
+
+std::string buildUpdateResponse(const std::string &entityType,
+                                const std::string &operation,
+                                bool success,
+                                const std::string &beforeJson,
+                                const std::string &afterJson,
+                                const std::string &errorMsg) {
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"success\":" << (success ? "true" : "false") << ",";
+    oss << "\"entityType\":\"" << entityType << "\",";
+    oss << "\"operation\":\""  << operation  << "\",";
+    oss << "\"before\":" << (beforeJson.empty() ? "null" : beforeJson) << ",";
+    oss << "\"after\":"  << (afterJson.empty()  ? "null" : afterJson)  << ",";
+    if (!errorMsg.empty()) {
+        oss << "\"error\":\"" << errorMsg << "\"";
+    } else {
+        oss << "\"error\":null";
+    }
+    oss << "}";
+    return oss.str();
+}
+
+// Normalize a code (IATA / airline, airport) to upper-case.
+std::string upperCopy(const std::string &s) {
+    std::string out = s;
+    for (char &c : out) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
 // Helper function to get the coordinates (lon, lat) of a route's endpoints.
 // Returns true on success, false if either airport code is unresolved.
 bool getCoordinatesForRoute(const Route &r,
@@ -1274,9 +1395,119 @@ std::string airportsSearchToJson(const std::string &query, int limit) {
     oss << "]";
     return oss.str();
 }
+std::string airlinesSearchToJson(const std::string &query, int limit) {
+    std::string q = query;
+
+    auto isSpace = [](unsigned char ch){ return std::isspace(ch); };
+    while (!q.empty() && isSpace((unsigned char)q.front())) q.erase(q.begin());
+    while (!q.empty() && isSpace((unsigned char)q.back()))  q.pop_back();
+
+    if (q.empty()) {
+        return "[]";
+    }
+
+    std::transform(q.begin(), q.end(), q.begin(),
+                   [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+
+    struct Candidate {
+        const Airline* al;
+        int score;
+        std::string display;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(64);
+
+    for (const auto &al : g_airlines) {
+        if (al.iata.empty() && al.icao.empty() && al.name.empty()) continue;
+
+        std::string iata    = al.iata;
+        std::string icao    = al.icao;
+        std::string name    = al.name;
+        std::string country = al.country;
+
+        auto lowerInPlace = [](std::string &s) {
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+        };
+        lowerInPlace(iata);
+        lowerInPlace(icao);
+        lowerInPlace(name);
+        lowerInPlace(country);
+
+        int score = 0;
+
+        // IATA / ICAO exact / prefix / contains
+        if (!iata.empty()) {
+            if (iata == q)                       score += 200;
+            else if (iata.rfind(q, 0) == 0)      score += 140;
+            else if (iata.find(q) != std::string::npos) score += 70;
+        }
+        if (!icao.empty()) {
+            if (icao == q)                       score += 150;
+            else if (icao.rfind(q, 0) == 0)      score += 90;
+            else if (icao.find(q) != std::string::npos) score += 40;
+        }
+
+        // Name & country
+        if (!name.empty()) {
+            if (name.rfind(q, 0) == 0)           score += 120;
+            else if (name.find(q) != std::string::npos) score += 60;
+        }
+        if (!country.empty()) {
+            if (country.rfind(q, 0) == 0)        score += 40;
+            else if (country.find(q) != std::string::npos) score += 20;
+        }
+
+        if (score == 0) continue;
+
+        std::string code = !al.iata.empty() ? al.iata : al.icao;
+        std::string display = al.name;
+        if (!code.empty()) {
+            if (!display.empty()) display += " (" + code + ")";
+            else display = code;
+        }
+
+        candidates.push_back(Candidate{&al, score, display});
+    }
+
+    if (candidates.empty()) {
+        return "[]";
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate &a, const Candidate &b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.display < b.display;
+              });
+
+    if (limit <= 0) limit = 10;
+    if ((int)candidates.size() > limit) {
+        candidates.resize(limit);
+    }
+
+    std::ostringstream oss;
+    oss << "[";
+    bool firstOut = true;
+    for (const auto &cand : candidates) {
+        const Airline &al = *cand.al;
+        std::string code = !al.iata.empty() ? al.iata : al.icao;
+        if (!firstOut) oss << ",";
+        firstOut = false;
+        oss << "{"
+            << "\"code\":\""    << jsonEscape(code)      << "\","
+            << "\"name\":\""    << jsonEscape(al.name)   << "\","
+            << "\"country\":\"" << jsonEscape(al.country)<< "\","
+            << "\"display\":\"" << jsonEscape(cand.display) << "\""
+            << "}";
+    }
+    oss << "]";
+    return oss.str();
+}
 // ---------- Main server ----------
 
 int main() {
+    std::cerr << "=== starting OpenFlights server main() ===\n";
     // Load all OpenFlights data at startup
     loadAirports("airports.dat");
     loadAirlines("airlines.dat");
@@ -1362,1708 +1593,1839 @@ int main() {
         if (pathOnly == "/" || pathOnly == "/index.html") {
             std::string body = R"HTML(
         <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8" />
-            <title>OpenFlights Route Finder</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-             <!-- NEW: Mapbox CSS + JS -->
-                <link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet" />
-                <script src="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js"></script>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8" />
+                    <title>OpenFlights Route Finder</title>
+                    <meta name="viewport" content="width=device-width, initial-scale=1" />
+                     <!-- NEW: Mapbox CSS + JS -->
+                        <link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet" />
+                        <script src="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js"></script>
 
-            <style>
-                body {
-                    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                    <style>
+                        body {
+                            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                            margin: 0;
+                            padding: 1.5rem;
+                            background: #f5f5f5;
+                            color: #222;
+                        }
+                        .container {
+                            max-width: 880px;
+                            margin: 0 auto;
+                            background: #ffffff;
+                            border-radius: 12px;
+                            padding: 1.5rem 1.75rem 1.75rem;
+                            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+                        }
+                .header-bar {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: flex-start;
+                    gap: 1rem;
+                    margin-bottom: 0.75rem;
+                }
+                
+                .header-left h1 {
                     margin: 0;
-                    padding: 1.5rem;
-                    background: #f5f5f5;
-                    color: #222;
-                }
-                .container {
-                    max-width: 880px;
-                    margin: 0 auto;
-                    background: #ffffff;
-                    border-radius: 12px;
-                    padding: 1.5rem 1.75rem 1.75rem;
-                    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-                }
-        .header-bar {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            gap: 1rem;
-            margin-bottom: 0.75rem;
-        }
-        
-        .header-left h1 {
-            margin: 0;
-            font-size: 1.7rem;
-        }
-        
-        .subtitle {
-            font-size: 0.85rem;
-            color: #6b7280;
-            margin-top: 0.15rem;
-        }
-        
-        .header-right {
-            display: flex;
-            align-items: center;
-            justify-content: flex-end;
-        }
-        
-        .top-tabs {
-            display: inline-flex;
-            background: #e5e7eb;
-            border-radius: 999px;
-            padding: 0.1rem;
-        }
-        
-        .top-tab {
-            border: none;
-            background: transparent;
-            cursor: pointer;
-            font-size: 0.8rem;
-            font-weight: 600;
-            padding: 0.25rem 0.8rem;
-            border-radius: 999px;
-            color: #4b5563;
-            white-space: nowrap;
-        }
-        
-        .top-tab.active {
-            background: #111827;
-            color: #f9fafb;
-        }
-        
-        .id-panel {
-            margin-bottom: 0.75rem;
-            display: none; /* default hidden; JS turns it on */
-        }
-        
-        .id-panel-status {
-            font-size: 0.8rem;
-            color: #6b7280;
-            margin-bottom: 0.25rem;
-        }
-        
-        .id-panel-body {
-            display: inline-block;
-            padding: 0.6rem 0.8rem;
-            border-radius: 0.5rem;
-            background: #f9fafb;
-            border: 1px solid #e5e7eb;
-            font-size: 0.85rem;
-            color: #111827;
-        }
-                h1 {
-                    margin-top: 0;
                     font-size: 1.7rem;
                 }
-                form {
-                    display: grid;
-                    gap: 0.75rem;
-                    margin-bottom: 1rem;
+                
+                .subtitle {
+                    font-size: 0.85rem;
+                    color: #6b7280;
+                    margin-top: 0.15rem;
                 }
-                .field-group {
+                
+                .header-right {
                     display: flex;
-                    flex-wrap: wrap;
-                    gap: 0.75rem;
+                    align-items: center;
+                    justify-content: flex-end;
                 }
-                .field {
-                    display: flex;
+
+                /* NEW: pill-style nav links (Airline/Airport/Update/About) */
+                .header-nav-pill {
+                    font-size: 0.8rem;
+                    text-decoration: none;
+                    padding: 0.35rem 0.9rem;
+                    border-radius: 999px;
+                    border: 1px solid #e5e7eb;
+                    background: #f9fafb;
+                    color: #111827;
+                    display: inline-flex;
                     flex-direction: column;
-                    min-width: 120px;
-                    flex: 1 1 0;
+                    align-items: center;
+                    justify-content: center;
+                    font-weight: 600;     /* bold like the Student tab */
+                    line-height: 1.1;
+                    text-align: center;
+                    white-space: normal;  /* allow wrapping to two lines */
                 }
-                label {
+
+                .header-nav-pill:hover {
+                    background: #f3f4f6;
+                }
+                
+                .top-tabs {
+                    display: inline-flex;
+                    background: #e5e7eb;
+                    border-radius: 999px;
+                    padding: 0.1rem;
+                }
+                .top-tab {
+                    border: none;
+                    background: transparent;
+                    cursor: pointer;
                     font-size: 0.8rem;
                     font-weight: 600;
-                    margin-bottom: 0.25rem;
-                    text-transform: uppercase;
-                    letter-spacing: 0.06em;
-                }
-                input[type="text"],
-                input[type="number"] {
-                    padding: 0.4rem 0.5rem;
-                    border-radius: 6px;
-                    border: 1px solid #d1d5db;
-                    font-size: 0.95rem;
-                }
-                input[type="text"]::placeholder {
-                    text-transform: none;
-                }
-                .checkbox-row {
-                    display: flex;
-                    align-items: center;
-                    gap: 0.4rem;
-                    margin-top: 0.35rem;
-                }
-                .button-row {
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 0.5rem;
-                    margin-top: 0.35rem;
-                }
-                .btn {
-                    padding: 0.45rem 0.9rem;
+                    padding: 0.25rem 0.8rem;
                     border-radius: 999px;
-                    border: none;
-                    font-size: 0.95rem;
-                    font-weight: 600;
-                    cursor: pointer;
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 0.25rem;
-                }
-                .btn-primary {
-                    background: #2563eb;
-                    color: #ffffff;
-                }
-                .btn-primary:hover {
-                    background: #1d4ed8;
-                }
-                .btn-secondary {
-                    background: #059669;
-                    color: #ffffff;
-                }
-                .btn-secondary:hover {
-                    background: #047857;
-                }
-                #error {
-                    margin-top: 0.25rem;
-                    color: #b91c1c;
-                    font-size: 0.9rem;
-                }
-                .hint {
-                    font-size: 0.85rem;
-                    color: #6b7280;
-                    margin-top: 0.25rem;
-                }
-        
-                /* Results layout (cards) */
-                h3 {
-                    margin-top: 1.25rem;
-                    margin-bottom: 0.5rem;
-                    font-size: 1.05rem;
-                }
-                .results-list {
-                    margin-top: 0.5rem;
-                    display: flex;
-                    flex-direction: column;
-                    gap: 0.75rem;
-                }
-                .route-card {
-                    background: #ffffff;
-                    border-radius: 12px;
-                    padding: 0.75rem 1rem;
-                    box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-                    font-size: 0.93rem;
-                }
-                .route-main-line {
-                    display: flex;
-                    align-items: center;
-                    gap: 0.35rem;
-                    font-weight: 600;
-                    margin-bottom: 0.25rem;
-                }
-                .route-city {
-                    font-size: 0.96rem;
-                }
-                .route-arrow {
-                    font-size: 0.85rem;
-                    color: #6b7280;
-                }
-                .route-tag {
-                    font-size: 0.72rem;
-                    font-weight: 600;
-                    padding: 0.1rem 0.55rem;
-                    border-radius: 999px;
-                    margin-left: 0.2rem;
+                    color: #4b5563;
                     white-space: nowrap;
                 }
-                .route-tag.nonstop {
-                    background: #e6f6ea;
-                    color: #137333;
+                
+                .top-tab.active {
+                    background: #111827;
+                    color: #f9fafb;
                 }
-                .route-tag.onehop {
-                    background: #e8f0fe;
-                    color: #174ea6;
+                
+                .id-panel {
+                    margin-bottom: 0.75rem;
+                    display: none; /* default hidden; JS turns it on */
                 }
-                .route-tag.codeshare {
-                    background: #fef7e0;
-                    color: #915b00;
+                
+                .id-panel-status {
+                    font-size: 0.8rem;
+                    color: #6b7280;
+                    margin-bottom: 0.25rem;
                 }
-                .route-tag.same-airline {
-                    background: #e0f2fe;
-                    color: #075985;
-                }
-                .route-tag.mixed-airlines {
-                    background: #fef2f2;
-                    color: #b91c1c;
-                }
-                .route-sub-line {
-                    font-size: 0.83rem;
-                    color: #4b5563;
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 0.4rem;
-                }
-                .route-distance {
-                    margin-left: auto;
-                    font-weight: 500;
+                
+                .id-panel-body {
+                    display: inline-block;
+                    padding: 0.6rem 0.8rem;
+                    border-radius: 0.5rem;
+                    background: #f9fafb;
+                    border: 1px solid #e5e7eb;
                     font-size: 0.85rem;
                     color: #111827;
                 }
-        .view-mode-tabs {
-            display: inline-flex;
-            gap: 0.25rem;
-            margin-top: 0.25rem;
-            margin-bottom: 0.4rem;
-            font-size: 0.8rem;
-        }
-
-        .view-tab {
-            border: none;
-            cursor: pointer;
-            background: #e5e7eb;
-            color: #111827;
-            padding: 0.15rem 0.7rem;
-            border-radius: 999px;
-            font-weight: 500;
-        }
-        
-        .view-tab:hover {
-            background: #d1d5db;
-        }
-        
-        .view-tab.active {
-            background: #111827;
-            color: #f9fafb;
-        }
-        
-        /* Autocomplete dropdown */
-        .autocomplete-container {
-          position: relative;
-        }
-        
-        .autocomplete-list {
-          position: absolute;
-          top: 100%;
-          left: 0;
-          right: 0;
-          z-index: 20;
-          max-height: 14rem;
-          overflow-y: auto;
-          margin-top: 0.25rem;
-          background: #ffffff;
-          border-radius: 0.5rem;
-          border: 1px solid #e5e7eb;
-          box-shadow: 0 10px 25px rgba(15,23,42,0.15);
-        }
-        
-        .autocomplete-item {
-          padding: 0.4rem 0.6rem;
-          font-size: 0.9rem;
-          cursor: pointer;
-        }
-        
-        .autocomplete-item:hover,
-        .autocomplete-item.active {
-          background: #f3f4f6;
-        }
-        
-        .autocomplete-empty {
-          padding: 0.4rem 0.6rem;
-          font-size: 0.85rem;
-          color: #6b7280;
-        }
-        
-        /* Shaded airline pill (same as airline-ui) */
-        .airline-pill {
-          display: inline-flex;
-          align-items: center;
-          background: #f1f5f9;  /* light gray */
-          color: #1e293b;       /* dark slate */
-          padding: 0.15rem 0.6rem 0.15rem 0.25rem;
-          border-radius: 999px;
-          font-size: 0.78rem;
-          font-weight: 500;
-          margin-right: 0.4rem;
-          white-space: nowrap;
-          line-height: 1;
-        }
-        .airline-pill img {
-            height: 1.25rem;
-            width: 1.25rem;
-            border-radius: 50%;
-            object-fit: contain;
-            margin-right: 0.35rem;
-            background: #ffffff;
-            border: 1px solid #e2e8f0;
-            flex-shrink: 0;
-        }
-                .no-results {
-                    font-size: 0.9rem;
-                    color: #6b7280;
-                }
-        
-        
-        
-        .autocomplete-container {
-                            position: relative;
+                        h1 {
+                            margin-top: 0;
+                            font-size: 1.7rem;
                         }
-                        .autocomplete-list {
-                            position: absolute;
-                            top: 100%;
-                            left: 0;
-                            right: 0;
-                            z-index: 20;
-                            max-height: 14rem;
-                            overflow-y: auto;
-                            margin-top: 0.25rem;
-                            background: #ffffff;
-                            border-radius: 0.5rem;
-                            border: 1px solid #e5e7eb;
-                            box-shadow: 0 10px 25px rgba(15,23,42,0.15);
+                        form {
+                            display: grid;
+                            gap: 0.75rem;
+                            margin-bottom: 1rem;
                         }
-                        .autocomplete-item {
-                            padding: 0.4rem 0.6rem;
-                            font-size: 0.9rem;
+                        .field-group {
+                            display: flex;
+                            flex-wrap: wrap;
+                            gap: 0.75rem;
+                        }
+                        .field {
+                            display: flex;
+                            flex-direction: column;
+                            min-width: 120px;
+                            flex: 1 1 0;
+                        }
+                        label {
+                            font-size: 0.8rem;
+                            font-weight: 600;
+                            margin-bottom: 0.25rem;
+                            text-transform: uppercase;
+                            letter-spacing: 0.06em;
+                        }
+                        input[type="text"],
+                        input[type="number"] {
+                            padding: 0.4rem 0.5rem;
+                            border-radius: 6px;
+                            border: 1px solid #d1d5db;
+                            font-size: 0.95rem;
+                        }
+                        input[type="text"]::placeholder {
+                            text-transform: none;
+                        }
+                        .checkbox-row {
+                            display: flex;
+                            align-items: center;
+                            gap: 0.4rem;
+                            margin-top: 0.35rem;
+                        }
+                        .button-row {
+                            display: flex;
+                            flex-wrap: wrap;
+                            gap: 0.5rem;
+                            margin-top: 0.35rem;
+                        }
+                        .btn {
+                            padding: 0.45rem 0.9rem;
+                            border-radius: 999px;
+                            border: none;
+                            font-size: 0.95rem;
+                            font-weight: 600;
                             cursor: pointer;
+                            display: inline-flex;
+                            align-items: center;
+                            gap: 0.25rem;
                         }
-                        .autocomplete-item:hover,
-                        .autocomplete-item.active {
-                            background: #f3f4f6;
+                        .btn-primary {
+                            background: #2563eb;
+                            color: #ffffff;
                         }
-                        .autocomplete-empty {
-                            padding: 0.4rem 0.6rem;
+                        .btn-primary:hover {
+                            background: #1d4ed8;
+                        }
+                        .btn-secondary {
+                            background: #059669;
+                            color: #ffffff;
+                        }
+                        .btn-secondary:hover {
+                            background: #047857;
+                        }
+                        #error {
+                            margin-top: 0.25rem;
+                            color: #b91c1c;
+                            font-size: 0.9rem;
+                        }
+                        .hint {
+                            font-size: 0.85rem;
+                            color: #6b7280;
+                            margin-top: 0.25rem;
+                        }
+                
+                        /* Results layout (cards) */
+                        h3 {
+                            margin-top: 1.25rem;
+                            margin-bottom: 0.5rem;
+                            font-size: 1.05rem;
+                        }
+                        .results-list {
+                            margin-top: 0.5rem;
+                            display: flex;
+                            flex-direction: column;
+                            gap: 0.75rem;
+                        }
+                        .route-card {
+                            background: #ffffff;
+                            border-radius: 12px;
+                            padding: 0.75rem 1rem;
+                            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+                            font-size: 0.93rem;
+                        }
+                        .route-main-line {
+                            display: flex;
+                            align-items: center;
+                            gap: 0.35rem;
+                            font-weight: 600;
+                            margin-bottom: 0.25rem;
+                        }
+                        .route-city {
+                            font-size: 0.96rem;
+                        }
+                        .route-arrow {
                             font-size: 0.85rem;
                             color: #6b7280;
                         }
-        
-        
-        /* Bar that holds filter pills */
-        .airline-filter-bar {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.4rem;
-            margin-bottom: 0.5rem;
-        }
-        .layover-filter-bar {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 0.4rem;
-          margin-bottom: 0.75rem;
-          align-items: center;
-        }
-
-        .layover-pill {
-          border-radius: 999px;
-          padding: 0.15rem 0.55rem;
-          border: 1px solid #ddd;
-          font-size: 0.78rem;
-          background: #f8f8f8;
-          cursor: pointer;
-        }
-
-        .layover-pill.active {
-          background: #2563eb;
-          border-color: #2563eb;
-          color: #fff;
-        }
-
-        .layover-pill .pill-count {
-          font-size: 0.68rem;
-          opacity: 0.8;
-          margin-left: 0.25rem;
-        }
-        /* Small clickable filter pills (AA, UA, DL, etc.) */
-        .filter-pill {
-            border: none;
-            cursor: pointer;
-            background: #e5e7eb;
-            color: #111827;
-            font-size: 0.78rem;
-            font-weight: 500;
-            border-radius: 999px;
-            padding: 0.15rem 0.7rem;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.3rem;
-            white-space: nowrap;
-        }
-        
-        .filter-pill:hover {
-            background: #d1d5db;
-        }
-        
-        .filter-pill.active {
-            background: #111827;
-            color: #f9fafb;
-        }
-        /* “Clear filters” pill-style button */
-        .clear-filters-btn {
-          border-radius: 999px;
-          border: 1px solid #d1d5db;
-          background: #f9fafb;
-          color: #374151;
-          font-size: 0.78rem;
-          font-weight: 500;
-          padding: 0.2rem 0.9rem;
-          cursor: pointer;
-          white-space: nowrap;
-          box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
-        }
-
-        .clear-filters-btn:hover {
-          background: #e5e7eb;
-        }
-        /* Scrollable code / JSON box (matches the JSON style you liked) */
-        .scroll-pre {
-          background: #020617;          /* same dark background */
-          color: #e5e7eb;
-          padding: 0.75rem;
-          border-radius: 0.5rem;
-          font-size: 0.8rem;
-          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-                       "Liberation Mono", "Courier New", monospace;
-          max-height: 24rem;
-          overflow: auto;
-          white-space: pre;
-        }
-        
-        /* Code panel container (for the Get Code section) */
-        .code-panel {
-          margin-top: 0.75rem;
-          border-radius: 0.75rem;
-          background: #0b1120;
-          border: 1px solid #1e293b;
-          padding: 0.75rem;
-        }
-        
-        .code-panel .panel-status {
-          font-size: 0.8rem;
-          color: #94a3b8;
-          margin-bottom: 0.5rem;
-        }
-        #routeMap {
-          height: 320px;
-          margin-top: 1rem;
-          margin-bottom: 1rem;
-          border-radius: 8px;
-        }
-        #homeRouteMap {
-                            height: 400px;
-                            margin-top: 1rem;
-                            margin-bottom: 1rem;
-                            border-radius: 8px;
+                        .route-tag {
+                            font-size: 0.72rem;
+                            font-weight: 600;
+                            padding: 0.1rem 0.55rem;
+                            border-radius: 999px;
+                            margin-left: 0.2rem;
+                            white-space: nowrap;
                         }
-                        /* NEW: Added hover effect for clickable cards */
-                        .route-card.clickable:hover {
-                            box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
-                            cursor: pointer;
-                            transform: translateY(-1px);
-                            transition: all 0.2s ease;
+                        .route-tag.nonstop {
+                            background: #e6f6ea;
+                            color: #137333;
                         }
-            </style>
-        </head>
-        <body>
-        <div class="container">
-            <div class="header-bar">
-              <div class="header-left">
-                <h1>OpenFlights Route Finder</h1>
-                <p class="subtitle">
-                  Example: SRC = <code>SFO</code>, DST = <code>JFK</code>.
-                </p>
-              </div>
-              <div class="header-right">
-                <div class="top-tabs">
-                  <button type="button" class="top-tab active" id="studentTab">
-                    Student
-                  </button>
-                  <button type="button" class="top-tab" id="codeTab">
-                    Code
-                  </button>
-                     </div>
-                      <a href="/airline-ui" style="margin-left:0.5rem;font-size:0.8rem;
-                          text-decoration:none;padding:0.3rem 0.6rem;border-radius:999px;
-                          border:1px solid #e5e7eb;background:#f9fafb;color:#374151;">
-                        Airline Routes
-                      </a>
-                    <a href="/airport-ui" style="margin-left:0.5rem;font-size:0.8rem;
-                                            text-decoration:none;padding:0.3rem 0.6rem;border-radius:999px;
-                                            border:1px solid #e5e7eb;background:#f9fafb;color:#374151;">
-                      Airport Airlines
-                    </a>
+                        .route-tag.onehop {
+                            background: #e8f0fe;
+                            color: #174ea6;
+                        }
+                        .route-tag.codeshare {
+                            background: #fef7e0;
+                            color: #915b00;
+                        }
+                        .route-tag.same-airline {
+                            background: #e0f2fe;
+                            color: #075985;
+                        }
+                        .route-tag.mixed-airlines {
+                            background: #fef2f2;
+                            color: #b91c1c;
+                        }
+                        .route-sub-line {
+                            font-size: 0.83rem;
+                            color: #4b5563;
+                            display: flex;
+                            flex-wrap: wrap;
+                            gap: 0.4rem;
+                        }
+                        .route-distance {
+                            margin-left: auto;
+                            font-weight: 500;
+                            font-size: 0.85rem;
+                            color: #111827;
+                        }
+                .view-mode-tabs {
+                  display: inline-flex;
+                  gap: 0.25rem;
+                  margin-top: 0.25rem;
+                  margin-bottom: 0.4rem;
+                  font-size: 0.8rem;
+                }
+
+                .view-tab {
+                    border: none;
+                    cursor: pointer;
+                    background: #e5e7eb;
+                    color: #111827;
+                    padding: 0.15rem 0.7rem;
+                    border-radius: 999px;
+                    font-weight: 500;
+                }
                 
-              </div>
-            </div>
-        
-            <!-- This panel appears under the tabs when "Student" is selected -->
-            <div id="idPanel" class="id-panel" style="display:none;">
-              <div id="idPanelStatus" class="id-panel-status"></div>
-              <div id="idPanelBody" class="id-panel-body"></div>
-            </div>
-            
-        <!-- CODE PANEL (hidden by default, shows /code contents in scrollable box) -->
-        
-            <div id="codePanel" class="code-panel" style="display:none">
-              <div id="codePanelStatus" class="panel-status"></div>
-              <pre id="codePanelBody" class="scroll-pre"></pre>
-            </div>
-            <form id="route-form">
-               <div class="field-group">
-                                   <div class="field autocomplete-container">
-                                       <label for="src">Source airport (IATA)</label>
-                                       <input id="src" name="src" type="text" maxlength="40" placeholder="e.g. SFO or San Diego"
-                                              autocomplete="off" />
-                                       <div id="src-suggestions" class="autocomplete-list" style="display:none;"></div>
-                                   </div>
-                                   <div class="field autocomplete-container">
-                                       <label for="dst">Destination airport (IATA)</label>
-                                       <input id="dst" name="dst" type="text" maxlength="40" placeholder="e.g. JFK or San Jose"
-                                              autocomplete="off" />
-                                       <div id="dst-suggestions" class="autocomplete-list" style="display:none;"></div>
-                                   </div>
-                               </div>
-        
-                <div class="field-group">
-                    <div class="field" style="max-width: 120px;">
-                        <label for="limit">Limit</label>
-                        <input id="limit" name="limit" type="number" min="1" value="20" />
-                    </div>
-                    <div class="field" style="max-width: 260px;">
-                        <label>Options</label>
-                        <div class="checkbox-row">
-                            <input id="recommended" name="recommended" type="checkbox" checked />
-                            <label for="recommended" style="margin:0;font-weight:400;text-transform:none;letter-spacing:0;">
-                                Recommended only (one-hop)
-                            </label>
-                        </div>
-                    </div>
-                </div>
-        
-                <div class="button-row">
-                    <button type="submit" class="btn btn-primary">
-                        Search One-Hop Routes
-                    </button>
-                    <button type="button" id="direct-button" class="btn btn-secondary">
-                        Search Non-Stop Routes
-                    </button>
-                </div>
-        
-                <div id="error"></div>
-                <div class="hint">
-                    Example: SRC = <code>SFO</code>, DST = <code>JFK</code>.
-                </div>
+                .view-tab:hover {
+                    background: #d1d5db;
+                }
                 
-            </form>
-        
-            <h3>Results</h3>
-        
-            <div id="homeRouteMap"></div>
+                .view-tab.active {
+                    background: #111827;
+                    color: #f9fafb;
+                }
+                
+                /* Autocomplete dropdown */
+                .autocomplete-container {
+                  position: relative;
+                }
+                
+                .autocomplete-list {
+                  position: absolute;
+                  top: 100%;
+                  left: 0;
+                  right: 0;
+                  z-index: 20;
+                  max-height: 14rem;
+                  overflow-y: auto;
+                  margin-top: 0.25rem;
+                  background: #ffffff;
+                  border-radius: 0.5rem;
+                  border: 1px solid #e5e7eb;
+                  box-shadow: 0 10px 25px rgba(15,23,42,0.15);
+                }
+                
+                .autocomplete-item {
+                  padding: 0.4rem 0.6rem;
+                  font-size: 0.9rem;
+                  cursor: pointer;
+                }
+                
+                .autocomplete-item:hover,
+                .autocomplete-item.active {
+                  background: #f3f4f6;
+                }
+                
+                .autocomplete-empty {
+                  padding: 0.4rem 0.6rem;
+                  font-size: 0.85rem;
+                  color: #6b7280;
+                }
+                
+                /* Shaded airline pill (same as airline-ui) */
+                .airline-pill {
+                  display: inline-flex;
+                  align-items: center;
+                  background: #f1f5f9;  /* light gray */
+                  color: #1e293b;       /* dark slate */
+                  padding: 0.15rem 0.6rem 0.15rem 0.25rem;
+                  border-radius: 999px;
+                  font-size: 0.78rem;
+                  font-weight: 500;
+                  margin-right: 0.4rem;
+                  white-space: nowrap;
+                  line-height: 1;
+                }
+                .airline-pill img {
+                    height: 1.25rem;
+                    width: 1.25rem;
+                    border-radius: 50%;
+                    object-fit: contain;
+                    margin-right: 0.35rem;
+                    background: #ffffff;
+                    border: 1px solid #e2e8f0;
+                    flex-shrink: 0;
+                }
+                        .no-results {
+                            font-size: 0.9rem;
+                            color: #6b7280;
+                        }
+                
+                
+                
+                .autocomplete-container {
+                                    position: relative;
+                                }
+                                .autocomplete-list {
+                                    position: absolute;
+                                    top: 100%;
+                                    left: 0;
+                                    right: 0;
+                                    z-index: 20;
+                                    max-height: 14rem;
+                                    overflow-y: auto;
+                                    margin-top: 0.25rem;
+                                    background: #ffffff;
+                                    border-radius: 0.5rem;
+                                    border: 1px solid #e5e7eb;
+                                    box-shadow: 0 10px 25px rgba(15,23,42,0.15);
+                                }
+                                .autocomplete-item {
+                                    padding: 0.4rem 0.6rem;
+                                    font-size: 0.9rem;
+                                    cursor: pointer;
+                                }
+                                .autocomplete-item:hover,
+                                .autocomplete-item.active {
+                                    background: #f3f4f6;
+                                }
+                                .autocomplete-empty {
+                                    padding: 0.4rem 0.6rem;
+                                    font-size: 0.85rem;
+                                    color: #6b7280;
+                                }
+                
+                
+                /* Bar that holds filter pills */
+                .airline-filter-bar {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 0.4rem;
+                    margin-bottom: 0.5rem;
+                }
+                .layover-filter-bar {
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 0.4rem;
+                  margin-bottom: 0.75rem;
+                  align-items: center;
+                }
 
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-top:0.25rem;margin-bottom:0.4rem;">
-                <div class="view-mode-tabs" id="viewModeTabs">
-                    <button class="view-tab active" data-mode="cards">Cards</button>
-                    <button class="view-tab" data-mode="json">JSON</button>
-                </div>
+                .layover-pill {
+                  border-radius: 999px;
+                  padding: 0.15rem 0.55rem;
+                  border: 1px solid #ddd;
+                  font-size: 0.78rem;
+                  background: #f8f8f8;
+                  cursor: pointer;
+                }
 
-                <!-- NEW: Clear Filters button on the right -->
-                <button type="button" id="clearFiltersBtn" class="clear-filters-btn">
-                    Clear filters
-                </button>
-            </div>
+                .layover-pill.active {
+                  background: #2563eb;
+                  border-color: #2563eb;
+                  color: #fff;
+                }
 
-          <div class="filters-row">
-            <div class="filters-left">
-              <div id="layoverFilters" class="layover-filter-bar"></div>
-              <!-- Airline filter pills live here -->
-              <div id="airlineFilters" class="airline-filter-bar"></div>
-            </div>
+                .layover-pill .pill-count {
+                  font-size: 0.68rem;
+                  opacity: 0.8;
+                  margin-left: 0.25rem;
+                }
+                /* Small clickable filter pills (AA, UA, DL, etc.) */
+                .filter-pill {
+                    border: none;
+                    cursor: pointer;
+                    background: #e5e7eb;
+                    color: #111827;
+                    font-size: 0.78rem;
+                    font-weight: 500;
+                    border-radius: 999px;
+                    padding: 0.15rem 0.7rem;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 0.3rem;
+                    white-space: nowrap;
+                }
+                
+                .filter-pill:hover {
+                    background: #d1d5db;
+                }
+                
+                .filter-pill.active {
+                    background: #111827;
+                    color: #f9fafb;
+                }
+                /* “Clear filters” pill-style button */
+                .clear-filters-btn {
+                  border-radius: 999px;
+                  border: 1px solid #d1d5db;
+                  background: #f9fafb;
+                  color: #374151;
+                  font-size: 0.78rem;
+                  font-weight: 500;
+                  padding: 0.2rem 0.9rem;
+                  cursor: pointer;
+                  white-space: nowrap;
+                  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+                }
 
-            <button id="clearFiltersButton" type="button" class="clear-filters-btn">
-              Clear filters
+                .clear-filters-btn:hover {
+                  background: #e5e7eb;
+                }
+                /* Scrollable code / JSON box (matches the JSON style you liked) */
+                .scroll-pre {
+                  background: #020617;          /* same dark background */
+                  color: #e5e7eb;
+                  padding: 0.75rem;
+                  border-radius: 0.5rem;
+                  font-size: 0.8rem;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                               "Liberation Mono", "Courier New", monospace;
+                  max-height: 24rem;
+                  overflow: auto;
+                  white-space: pre;
+                }
+                
+                /* Code panel container (for the Get Code section) */
+                .code-panel {
+                  margin-top: 0.75rem;
+                  border-radius: 0.75rem;
+                  background: #0b1120;
+                  border: 1px solid #1e293b;
+                  padding: 0.75rem;
+                }
+                
+                .code-panel .panel-status {
+                  font-size: 0.8rem;
+                  color: #94a3b8;
+                  margin-bottom: 0.5rem;
+                }
+                #routeMap {
+                  height: 320px;
+                  margin-top: 1rem;
+                  margin-bottom: 1rem;
+                  border-radius: 8px;
+                }
+                /* Add space between the map (with its attribution text) and the chips below */
+                #routeMap {
+                  margin-bottom: 1.5rem;   /* tweak 1.0–2.0rem to taste */
+                }
+                #homeRouteMap {
+                                    height: 400px;
+                                    margin-top: 1rem;
+                                    margin-bottom: 1rem;
+                                    border-radius: 8px;
+                                }
+                                /* NEW: Added hover effect for clickable cards */
+                                .route-card.clickable:hover {
+                                    box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
+                                    cursor: pointer;
+                                    transform: translateY(-1px);
+                                    transition: all 0.2s ease;
+                                }
+                    .route-card.selected {
+                        border: 2px solid #2563eb;   /* same blue as the map highlight */
+                        background: #eff6ff;         /* light blue */
+                    }
+                    </style>
+                </head>
+                <body>
+                <div class="container">
+                    <div class="header-bar">
+                      <div class="header-left">
+                        <h1>OpenFlights Route Finder</h1>
+                        <p class="subtitle">
+                          Example: SRC = <code>SFO</code>, DST = <code>JFK</code>.
+                        </p>
+                      </div>
+                      <div class="header-right">
+          <div class="top-tabs">
+            <button type="button" class="top-tab active" id="studentTab">
+              Student
+            </button>
+            <button type="button" class="top-tab" id="codeTab">
+              Code
             </button>
           </div>
-        
-            <div id="resultsList" class="results-list">
-                <p class="no-results">(no results yet)</p>
-            </div>
-        
-        <script>
-        (function () {
-            const studentTab = document.getElementById("studentTab");
-            const codeTab    = document.getElementById("codeTab");
-        
-            const idPanel        = document.getElementById("idPanel");
-            const idPanelStatus  = document.getElementById("idPanelStatus");
-            const idPanelBody    = document.getElementById("idPanelBody");
-        
-            const codePanel       = document.getElementById("codePanel");
-            const codePanelStatus = document.getElementById("codePanelStatus");
-            const codePanelBody   = document.getElementById("codePanelBody");
 
-            let idLoaded    = false;
-            let studentOpen = false;
-            let codeLoaded  = false;
-            let codeOpen    = false;
-        
-        mapboxgl.accessToken = 'pk.eyJ1IjoiY2hyaXN0aW5lcnlhbjkzIiwiYSI6ImNtaWJnZDhiMDAxN2sya29sNXZvNHExMXkifQ.6K3wdjmIhFRQD3bre4f_DA';
+          <a href="/airline-ui"
+             class="header-nav-pill"
+             style="margin-left:0.5rem;">
+            Airline<br>Routes
+          </a>
 
-                    const INITIAL_CENTER = [-98.5, 39.8]; // Center of the US (approx)
-                    const INITIAL_ZOOM = 2; // World view
-                    
-                    // Map instance (container ID changed to homeRouteMap)
-                    const homeMap = new mapboxgl.Map({
-                        container: 'homeRouteMap',
-                        style: 'mapbox://styles/mapbox/light-v11',
-                        center: INITIAL_CENTER,
-                        zoom: INITIAL_ZOOM
-                    });
-                    
-                    let homeMapIsLoaded = false; 
-                    let activeRouteId = null; // Stores the ID of the currently selected route
-                    
-                    homeMap.on('load', () => {
-                                    homeMapIsLoaded = true;
-                                    // Initialize the two layers we'll use: a base layer and a highlight layer.
-                                    homeMap.addSource('route-display-source', {
-                                        'type': 'geojson',
-                                        'data': { type: 'FeatureCollection', features: [] }
-                                    });
+          <a href="/airport-ui"
+             class="header-nav-pill"
+             style="margin-left:0.5rem;">
+            Airport<br>Airlines
+          </a>
 
-                                    // 1. Base Layer (Thin, low opacity)
-                                    homeMap.addLayer({
-                                        'id': 'routes-base-layer',
-                                        'type': 'line',
-                                        'source': 'route-display-source',
-                                        'layout': { 'line-join': 'round', 'line-cap': 'round' },
-                                        'paint': {
-                                            'line-color': '#9ca3af', // Gray
-                                            'line-width': 1.0,
-                                            'line-opacity': 0.6
+          <a href="/update-ui"
+             class="header-nav-pill"
+             style="margin-left:0.5rem;">
+            Update<br>Data
+          </a>
+
+          <a href="/about-ui"
+             class="header-nav-pill"
+             style="margin-left:0.5rem;">
+            About this<br>Project
+          </a>
+        </div>
+                    </div>
+                
+                    <!-- This panel appears under the tabs when "Student" is selected -->
+                    <div id="idPanel" class="id-panel" style="display:none;">
+                      <div id="idPanelStatus" class="id-panel-status"></div>
+                      <div id="idPanelBody" class="id-panel-body"></div>
+                    </div>
+                    
+                <!-- CODE PANEL (hidden by default, shows /code contents in scrollable box) -->
+                
+                    <div id="codePanel" class="code-panel" style="display:none">
+                      <div id="codePanelStatus" class="panel-status"></div>
+                      <pre id="codePanelBody" class="scroll-pre"></pre>
+                    </div>
+                    <form id="route-form">
+                       <div class="field-group">
+                                           <div class="field autocomplete-container">
+                                               <label for="src">Source airport (IATA)</label>
+                                               <input id="src" name="src" type="text" maxlength="40" placeholder="e.g. SFO or San Diego"
+                                                      autocomplete="off" />
+                                               <div id="src-suggestions" class="autocomplete-list" style="display:none;"></div>
+                                           </div>
+                                           <div class="field autocomplete-container">
+                                               <label for="dst">Destination airport (IATA)</label>
+                                               <input id="dst" name="dst" type="text" maxlength="40" placeholder="e.g. JFK or San Jose"
+                                                      autocomplete="off" />
+                                               <div id="dst-suggestions" class="autocomplete-list" style="display:none;"></div>
+                                           </div>
+                                       </div>
+                
+                        <div class="field-group">
+                            <div class="field" style="max-width: 120px;">
+                                <label for="limit">Limit</label>
+                                <input id="limit" name="limit" type="number" min="1" value="20" />
+                            </div>
+                            <div class="field" style="max-width: 260px;">
+                                <label>Options</label>
+                                <div class="checkbox-row">
+                                    <input id="recommended" name="recommended" type="checkbox" checked />
+                                    <label for="recommended" style="margin:0;font-weight:400;text-transform:none;letter-spacing:0;">
+                                        Recommended only (one-hop)
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                
+                        <div class="button-row">
+                            <button type="submit" class="btn btn-primary">
+                                Search One-Hop Routes
+                            </button>
+                            <button type="button" id="direct-button" class="btn btn-secondary">
+                                Search Non-Stop Routes
+                            </button>
+                        </div>
+                
+                        <div id="error"></div>
+                        <div class="hint">
+                            Example: SRC = <code>SFO</code>, DST = <code>JFK</code>.
+                        </div>
+                        
+                    </form>
+                
+                    <h3>Results</h3>
+                
+                    <div id="homeRouteMap"></div>
+
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-top:0.25rem;margin-bottom:0.4rem;">
+                        <div class="view-mode-tabs" id="viewModeTabs">
+                            <button class="view-tab active" data-mode="cards">Cards</button>
+                            <button class="view-tab" data-mode="json">JSON</button>
+                        </div>
+
+                        <!-- NEW: Clear Filters button on the right -->
+                        <button type="button" id="clearFiltersBtn" class="clear-filters-btn">
+                            Clear filters
+                        </button>
+                    </div>
+
+                  <div class="filters-row">
+                    <div class="filters-left">
+                      <div id="layoverFilters" class="layover-filter-bar"></div>
+                      <!-- Airline filter pills live here -->
+                      <div id="airlineFilters" class="airline-filter-bar"></div>
+                    </div>
+                  </div>
+                
+                    <div id="resultsList" class="results-list">
+                        <p class="no-results">(no results yet)</p>
+                    </div>
+                
+                <script>
+                (function () {
+                    const studentTab = document.getElementById("studentTab");
+                    const codeTab    = document.getElementById("codeTab");
+                
+                    const idPanel        = document.getElementById("idPanel");
+                    const idPanelStatus  = document.getElementById("idPanelStatus");
+                    const idPanelBody    = document.getElementById("idPanelBody");
+                
+                    const codePanel       = document.getElementById("codePanel");
+                    const codePanelStatus = document.getElementById("codePanelStatus");
+                    const codePanelBody   = document.getElementById("codePanelBody");
+
+                    let idLoaded    = false;
+                    let studentOpen = false;
+                    let codeLoaded  = false;
+                    let codeOpen    = false;
+                
+                mapboxgl.accessToken = 'pk.eyJ1IjoiY2hyaXN0aW5lcnlhbjkzIiwiYSI6ImNtaWJnZDhiMDAxN2sya29sNXZvNHExMXkifQ.6K3wdjmIhFRQD3bre4f_DA';
+
+                            const INITIAL_CENTER = [-98.5, 39.8]; // Center of the US (approx)
+                            const INITIAL_ZOOM = 2; // World view
+                            
+                            // Map instance (container ID changed to homeRouteMap)
+                            const homeMap = new mapboxgl.Map({
+                                container: 'homeRouteMap',
+                                style: 'mapbox://styles/mapbox/light-v11',
+                                center: INITIAL_CENTER,
+                                zoom: INITIAL_ZOOM
+                            });
+                            
+                            let homeMapIsLoaded = false; 
+                            let activeRouteId = null; // Stores the ID of the currently selected route
+                            
+                            homeMap.on('load', () => {
+                                            homeMapIsLoaded = true;
+                                            // Initialize the two layers we'll use: a base layer and a highlight layer.
+                                            homeMap.addSource('route-display-source', {
+                                                'type': 'geojson',
+                                                'data': { type: 'FeatureCollection', features: [] }
+                                            });
+
+                                            // 1. Base Layer (Thin, low opacity)
+                                            homeMap.addLayer({
+                                                'id': 'routes-base-layer',
+                                                'type': 'line',
+                                                'source': 'route-display-source',
+                                                'layout': { 'line-join': 'round', 'line-cap': 'round' },
+                                                'paint': {
+                                                    'line-color': '#9ca3af', // Gray
+                                                    'line-width': 1.0,
+                                                    'line-opacity': 0.6
+                                                }
+                                            });
+
+                                            // 2. Highlight Layer (Thick, bright color, filtered to one route)
+                                            homeMap.addLayer({
+                                                'id': 'routes-highlight-layer',
+                                                'type': 'line',
+                                                'source': 'route-display-source',
+                                                // CORRECTED FILTER SYNTAX: Filter on the 'id' property in features.properties
+                                                'filter': ['==', ['get', 'id'], ''], // Start filtered (show nothing)
+                                                'layout': { 'line-join': 'round', 'line-cap': 'round' },
+                                                'paint': {
+                                                    'line-color': '#2563eb', // Bright Blue
+                                                    'line-width': 3.0,
+                                                    'line-opacity': 1.0
+                                                }
+                                            });
+                                        // 🔥 ADD THIS BLOCK ↓↓↓↓↓↓↓↓↓↓↓↓
+                                            homeMap.on('click', 'routes-base-layer', (e) => {
+                                                if (!e.features.length) return;
+
+                                                const routeId = e.features[0].properties.id;
+
+                                                highlightRoute(routeId);
+
+                                                // Filter results to just this card
+                                                focusedRouteId = routeId;
+                                                applyRouteFocusToCards();
+                                            });
+
+                                            homeMap.on('mouseenter', 'routes-base-layer', () => {
+                                                homeMap.getCanvas().style.cursor = 'pointer';
+                                            });
+
+                                            homeMap.on('mouseleave', 'routes-base-layer', () => {
+                                                homeMap.getCanvas().style.cursor = '';
+                                            });
+                                            // 🔥 END INSERTED BLOCK
+                                        });
+                            // --- End Mapbox Setup ---
+                /** Removes all data and highlights from the home map (safer implementation). */
+                            function clearHomeMap() {
+                                activeRouteId = null;
+                                if (!homeMapIsLoaded) return;
+
+                                const src = homeMap.getSource('route-display-source');
+                                if (src) {
+                                    // Set source data to empty
+                                    src.setData({ type: 'FeatureCollection', features: [] });
+                                }
+
+                                // Set highlight filter to empty if the layer exists
+                                if (homeMap.getLayer('routes-highlight-layer')) {
+                                    homeMap.setFilter('routes-highlight-layer', ['==', ['get', 'id'], '']);
+                                }
+                                
+                                homeMap.flyTo({ center: INITIAL_CENTER, zoom: INITIAL_ZOOM });
+                            }
+
+                            /** Updates the Mapbox highlight filter to show one route. */
+                            function highlightRoute(routeId) {
+                                activeRouteId = routeId;
+                                if (!homeMapIsLoaded) return;
+                                
+                                // CORRECTED FILTER SYNTAX: Use ['get', 'id'] to filter on feature property
+                                homeMap.setFilter('routes-highlight-layer', ['==', ['get', 'id'], routeId]);
+                            }
+                            
+
+                            /**
+                             * Renders routes on the map using the filtered array to ensure index alignment.
+                             * @param {string} mode - 'direct' or 'onehop'
+                             * @param {object} data - The full JSON response (for shared properties like source/destination)
+                             * @param {Array} filteredRoutes - The routes array that is actually displayed as cards
+                             */
+                            function renderRoutesOnHomeMap(mode, data, filteredRoutes) {
+                                clearHomeMap();
+                                if (!homeMapIsLoaded) return;
+                                
+                                const features = [];
+                                let bounds = new mapboxgl.LngLatBounds();
+                                let hasBounds = false;
+
+                                filteredRoutes.forEach((route, index) => {
+                                    // Data check: Assumes data.source and data.destination are available.
+                                    const src = data.source;
+                                    const dst = data.destination;
+                                    
+                                    if (!src || !dst || src.longitude === undefined || dst.longitude === undefined) {
+                                        return;
+                                    }
+                                    
+                                    const id = mode + '-' + index;
+                                    let coordinates;
+                                    
+                                    if (mode === 'direct') {
+                                        // Direct flight: Source to Destination
+                                        coordinates = [[src.longitude, src.latitude], [dst.longitude, dst.latitude]];
+                                    } else { 
+                                        // One-hop flight: Source to Via to Destination
+                                        // Assumes 'route' (a hop object) contains a 'via' airport object
+                                        const via = route.viaAirport || route.via; // Use route.via for consistency
+                                        
+                                        if (!via || via.longitude === undefined) {
+                                             return; // Skip if via airport data is missing
                                         }
-                                    });
+                                        
+                                        coordinates = [
+                                            [src.longitude, src.latitude],
+                                            [via.longitude, via.latitude],
+                                            [dst.longitude, dst.latitude]
+                                        ];
+                                    }
 
-                                    // 2. Highlight Layer (Thick, bright color, filtered to one route)
-                                    homeMap.addLayer({
-                                        'id': 'routes-highlight-layer',
-                                        'type': 'line',
-                                        'source': 'route-display-source',
-                                        // CORRECTED FILTER SYNTAX: Filter on the 'id' property in features.properties
-                                        'filter': ['==', ['get', 'id'], ''], // Start filtered (show nothing)
-                                        'layout': { 'line-join': 'round', 'line-cap': 'round' },
-                                        'paint': {
-                                            'line-color': '#2563eb', // Bright Blue
-                                            'line-width': 3.0,
-                                            'line-opacity': 1.0
+                                    coordinates.forEach(c => { bounds.extend(c); hasBounds = true; });
+
+                                    features.push({
+                                        'type': 'Feature',
+                                        'geometry': {
+                                            'type': 'LineString',
+                                            'coordinates': coordinates
+                                        },
+                                        'properties': {
+                                            'id': id,
+                                            'route_id': id, // Redundant but harmless, using 'id' for the filter
                                         }
                                     });
                                 });
-                    // --- End Mapbox Setup ---
-        /** Removes all data and highlights from the home map (safer implementation). */
-                    function clearHomeMap() {
-                        activeRouteId = null;
-                        if (!homeMapIsLoaded) return;
-
-                        const src = homeMap.getSource('route-display-source');
-                        if (src) {
-                            // Set source data to empty
-                            src.setData({ type: 'FeatureCollection', features: [] });
-                        }
-
-                        // Set highlight filter to empty if the layer exists
-                        if (homeMap.getLayer('routes-highlight-layer')) {
-                            homeMap.setFilter('routes-highlight-layer', ['==', ['get', 'id'], '']);
-                        }
-                        
-                        homeMap.flyTo({ center: INITIAL_CENTER, zoom: INITIAL_ZOOM });
-                    }
-
-                    /** Updates the Mapbox highlight filter to show one route. */
-                    function highlightRoute(routeId) {
-                        activeRouteId = routeId;
-                        if (!homeMapIsLoaded) return;
-                        
-                        // CORRECTED FILTER SYNTAX: Use ['get', 'id'] to filter on feature property
-                        homeMap.setFilter('routes-highlight-layer', ['==', ['get', 'id'], routeId]);
-                    }
-
-                    /**
-                     * Renders routes on the map using the filtered array to ensure index alignment.
-                     * @param {string} mode - 'direct' or 'onehop'
-                     * @param {object} data - The full JSON response (for shared properties like source/destination)
-                     * @param {Array} filteredRoutes - The routes array that is actually displayed as cards
-                     */
-                    function renderRoutesOnHomeMap(mode, data, filteredRoutes) {
-                        clearHomeMap();
-                        if (!homeMapIsLoaded) return;
-                        
-                        const features = [];
-                        let bounds = new mapboxgl.LngLatBounds();
-                        let hasBounds = false;
-
-                        filteredRoutes.forEach((route, index) => {
-                            // Data check: Assumes data.source and data.destination are available.
-                            const src = data.source;
-                            const dst = data.destination;
-                            
-                            if (!src || !dst || src.longitude === undefined || dst.longitude === undefined) {
-                                return;
-                            }
-                            
-                            const id = mode + '-' + index;
-                            let coordinates;
-                            
-                            if (mode === 'direct') {
-                                // Direct flight: Source to Destination
-                                coordinates = [[src.longitude, src.latitude], [dst.longitude, dst.latitude]];
-                            } else { 
-                                // One-hop flight: Source to Via to Destination
-                                // Assumes 'route' (a hop object) contains a 'via' airport object
-                                const via = route.viaAirport || route.via; // Use route.via for consistency
                                 
-                                if (!via || via.longitude === undefined) {
-                                     return; // Skip if via airport data is missing
+                                // Update the Mapbox source with all the features
+                                homeMap.getSource('route-display-source').setData({
+                                    type: 'FeatureCollection',
+                                    features: features
+                                });
+
+                                // Fit map to bounds if we have routes
+                                if (hasBounds) {
+                                    homeMap.fitBounds(bounds, {
+                                        padding: 80, 
+                                        maxZoom: 6,
+                                        duration: 1000
+                                    });
                                 }
-                                
-                                coordinates = [
-                                    [src.longitude, src.latitude],
-                                    [via.longitude, via.latitude],
-                                    [dst.longitude, dst.latitude]
-                                ];
                             }
-
-                            coordinates.forEach(c => { bounds.extend(c); hasBounds = true; });
-
-                            features.push({
-                                'type': 'Feature',
-                                'geometry': {
-                                    'type': 'LineString',
-                                    'coordinates': coordinates
-                                },
-                                'properties': {
-                                    'id': id,
-                                    'route_id': id, // Redundant but harmless, using 'id' for the filter
-                                }
-                            });
-                        });
-                        
-                        // Update the Mapbox source with all the features
-                        homeMap.getSource('route-display-source').setData({
-                            type: 'FeatureCollection',
-                            features: features
-                        });
-
-                        // Fit map to bounds if we have routes
-                        if (hasBounds) {
-                            homeMap.fitBounds(bounds, {
-                                padding: 80, 
-                                maxZoom: 6,
-                                duration: 1000
-                            });
-                        }
+                    function setActiveTopTab(which) {
+                      // which: "student", "code", or null
+                      if (which === "student") {
+                        studentTab.classList.add("active");
+                      } else {
+                        studentTab.classList.remove("active");
+                      }
+                
+                      if (which === "code") {
+                        codeTab.classList.add("active");
+                      } else {
+                        codeTab.classList.remove("active");
+                      }
                     }
-            function setActiveTopTab(which) {
-              // which: "student", "code", or null
-              if (which === "student") {
-                studentTab.classList.add("active");
-              } else {
-                studentTab.classList.remove("active");
-              }
-        
-              if (which === "code") {
-                codeTab.classList.add("active");
-              } else {
-                codeTab.classList.remove("active");
-              }
-            }
-        
-            // STUDENT tab: toggle open/closed
-            studentTab.addEventListener("click", () => {
-              if (studentOpen) {
-                // close student panel
-                studentOpen = false;
-                idPanel.style.display = "none";
-                setActiveTopTab(null);
-                return;
-              }
-        
-              // open student panel, close code panel
-              studentOpen = true;
-              codeOpen    = false;
-              codePanel.style.display = "none";
-        
-              idPanel.style.display = "block";
-              setActiveTopTab("student");
-        
-              if (!idLoaded) {
-                idPanelStatus.textContent = "Loading…";
-                idPanelBody.innerHTML = "";
-                fetch("/id")
-                  .then(resp => {
-                    if (!resp.ok) throw new Error("HTTP " + resp.status);
-                    return resp.json();
-                  })
-                  .then(data => {
-                    idLoaded = true;
-                    idPanelStatus.textContent = "";
-                    idPanelBody.innerHTML =
-                      "<strong>Name:</strong> " + (data.name || "?") + "<br/>" +
-                      "<strong>Student ID:</strong> " + (data.student_id || "?");
-                  })
-                  .catch(err => {
-                    console.error(err);
-                    idPanelStatus.textContent = "Could not load student info.";
-                  });
-              }
-            });
-        
-            // CODE tab: toggle open/closed, show /code in scrollable <pre>
-            codeTab.addEventListener("click", () => {
-              if (codeOpen) {
-                // close code panel
-                codeOpen = false;
-                codePanel.style.display = "none";
-                setActiveTopTab(null);
-                return;
-              }
-        
-              // open code panel, close student panel
-              codeOpen    = true;
-              studentOpen = false;
-              idPanel.style.display = "none";
-        
-              codePanel.style.display = "block";
-              setActiveTopTab("code");
-        
-              if (!codeLoaded) {
-                codePanelStatus.textContent = "Loading code…";
-                codePanelBody.textContent = "";
-        
-                fetch("/code")
-                  .then(resp => {
-                    if (!resp.ok) throw new Error("HTTP " + resp.status);
-                    return resp.text();
-                  })
-                  .then(text => {
-                    codeLoaded = true;
-                    codePanelStatus.textContent = "";
-                    codePanelBody.textContent = text;  // goes into the <pre>
-                  })
-                  .catch(err => {
-                    console.error(err);
-                    codePanelStatus.textContent = "Could not load code.";
-                  });
-              }
-            });
-            const form = document.getElementById("route-form");
-            const srcInput = document.getElementById("src");
-            const dstInput = document.getElementById("dst");
-            const srcSuggestions = document.getElementById("src-suggestions");
-            const dstSuggestions = document.getElementById("dst-suggestions");
-            const limitInput = document.getElementById("limit");
-            const recommendedInput = document.getElementById("recommended");
-            const directButton = document.getElementById("direct-button");
-            const errorEl = document.getElementById("error");
-            const resultsList = document.getElementById("resultsList");
-            const airlineFilters = document.getElementById("airlineFilters");
-            const viewModeTabs = document.getElementById("viewModeTabs");
-            const viewTabButtons = viewModeTabs.querySelectorAll(".view-tab");
-            const layoverFilters = document.getElementById("layoverFilters");
-            const clearFiltersBtn = document.getElementById("clearFiltersBtn");
-            
-        // "cards" or "json"
-            let viewMode = "cards";
-        
-            // --- Aircraft code → human-readable name mapping (common types) ---
-            const AIRCRAFT_NAMES = {
-                // Airbus
-                "318": "Airbus A318",
-                "319": "Airbus A319",
-                "320": "Airbus A320",
-                "321": "Airbus A321",
-                "332": "Airbus A330-200",
-                "333": "Airbus A330-300",
-                "388": "Airbus A380-800",
-        
-                // Boeing narrow-body
-                "732": "Boeing 737-200",
-                "733": "Boeing 737-300",
-                "734": "Boeing 737-400",
-                "735": "Boeing 737-500",
-                "736": "Boeing 737-600",
-                "737": "Boeing 737-700",
-                "738": "Boeing 737-800",
-                "739": "Boeing 737-900",
-                "73G": "Boeing 737-700",
-                "73W": "Boeing 737-700 (winglets)",
-        
-                // Boeing wide-body (some common ones)
-                "744": "Boeing 747-400",
-                "752": "Boeing 757-200",
-                "753": "Boeing 757-300",
-                "762": "Boeing 767-200",
-                "763": "Boeing 767-300",
-                "764": "Boeing 767-400",
-                "772": "Boeing 777-200",
-                "773": "Boeing 777-300",
-                "77W": "Boeing 777-300ER",
-                "788": "Boeing 787-8",
-                "789": "Boeing 787-9",
-                "78X": "Boeing 787-10",
-        
-                // Regional jets / turboprops (a small sample)
-                "CR2": "Bombardier CRJ200",
-                "CR7": "Bombardier CRJ700",
-                "CR9": "Bombardier CRJ900",
-                "E70": "Embraer 170",
-                "E75": "Embraer 175",
-                "E90": "Embraer 190",
-                "DH3": "De Havilland Canada DHC-8-300",
-                "DH4": "De Havilland Canada DHC-8-400"
-                // anything not listed will just show its raw code
-            };
-        
-            // Turn "738 320 319 739 73G" → "Boeing 737-800, Airbus A320, Airbus A319, Boeing 737-900, Boeing 737-700"
-            function formatEquipment(equipmentStr) {
-                if (!equipmentStr) return "";
-                const seen = new Set();
-                const labels = [];
-        
-                equipmentStr.split(/\s+/).forEach(code => {
-                    if (!code) return;
-                    if (seen.has(code)) return;      // dedupe
-                    seen.add(code);
-                    const label = AIRCRAFT_NAMES[code] || code;  // fallback to raw code if unknown
-                    labels.push(label);
-                });
-        
-                return labels.join(", ");
-            }
-            // Remember last results so we can re-render when filter changes
-            let lastMode = null;          // "direct" | "onehop" | null
-            let lastDirectData = null;    // JSON from /direct
-            let lastOneHopData = null;    // JSON from /onehop
-            let activeAirlineFilter = null; // e.g. "AA" or null for "all"
-            let activeLayoverFilter = null;  // NEW: currently selected via airport, e.g. "DEN"
-        
-            /** Normalize airline code from an airline object */
-            function getAirlineCodeFromObj(airlineObj) {
-                if (!airlineObj) return "";
-                const code = airlineObj.iata || airlineObj.icao || airlineObj.code || "";
-                return code ? code.toUpperCase() : "";
-            }
-        
-            function setError(msg) {
-                errorEl.textContent = msg || "";
-            }
-        /** From a one-hop route object, return the via airport (if any). */
-        function getViaAirportFromHop(hop) {
-            if (!hop) return null;
-
-            // Your JSON likely uses hop.via, but be defensive:
-            if (hop.via) return hop.via;
-            if (hop.via_airport) return hop.via_airport;
-            if (hop.viaAirport) return hop.viaAirport;
-
-            return null;
-        }
-        
-            function clearResults() {
-                resultsList.innerHTML = "";
-            }
-        
-            function extractIataFromInput(inputEl) {
-                            const raw = (inputEl.value || "").trim().toUpperCase();
-                            if (!raw) return "";
-        
-                            // If it ends in "(XXX)" grab XXX
-                            const m = raw.match(/\(([A-Z0-9]{3})\)\s*$/);
-                            if (m) return m[1];
-        
-                            // If the whole thing is a 3-letter code, use it
-                            if (/^[A-Z0-9]{3}$/.test(raw)) return raw;
-        
-                            // Fallback: just return whatever (so old behavior still sort-of works)
-                            return raw;
-                        }
-        
-                        function getSrcDstOrError() {
-                            const src = extractIataFromInput(srcInput);
-                            const dst = extractIataFromInput(dstInput);
-                            if (!src || !dst) {
-                                setError("Please enter both source and destination IATA codes.");
-                                return null;
-                            }
-                            return { src, dst };
-                        }
-        //helper func
-        function updateViewModeTabs() {
-            viewTabButtons.forEach(btn => {
-                const mode = btn.getAttribute("data-mode");
-                if (mode === viewMode) {
-                    btn.classList.add("active");
-                } else {
-                    btn.classList.remove("active");
-                }
-            });
-        }
-        // --- Airline logo helpers ---
-        
-            function getAirlineLogoUrl(code) {
-                if (!code || code === "\\N") {
-                    // Simple placeholder for unknown codes
-                    return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
-                }
-                // Kiwi has a nice simple pattern for airline logos by IATA code
-                return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
-            }
-        
-            function createAirlinePill(airlineObj) {
-                const name  = airlineObj.name || airlineObj.code || "Unknown airline";
-                const code  = airlineObj.iata || airlineObj.icao || airlineObj.code || "";
-                const label = code ? (name + " (" + code + ")") : name;
-        
-                const pill = document.createElement("span");
-                pill.className = "airline-pill";
-        
-                const logo = document.createElement("img");
-                logo.src = getAirlineLogoUrl(airlineObj.iata || airlineObj.icao || "");
-                logo.alt = label + " logo";
-                logo.onerror = function () {
-                    // Hide logo if the image 404s
-                    this.style.display = "none";
-                };
-        
-                pill.appendChild(logo);
-                pill.appendChild(document.createTextNode(label));
-                return pill;
-            }
-        
-        function collectAirlineCodesFromDirect(data) {
-            const codes = new Set();
-            (data.direct_flights || []).forEach(f => {
-                codes.add(getAirlineCodeFromObj(f.airline || {}));
-            });
-            codes.delete(""); // remove empty
-            return codes;
-        }
-        
-        function collectAirlineCodesFromOneHop(data) {
-            const codes = new Set();
-            (data.one_hop_routes || []).forEach(hop => {
-                const first = hop.first_leg || {};
-                const second = hop.second_leg || {};
-                codes.add(getAirlineCodeFromObj(first.airline || {}));
-                codes.add(getAirlineCodeFromObj(second.airline || {}));
-            });
-            codes.delete("");
-            return codes;
-        }
-        function collectLayoverCodesFromOneHop(data) {
-            const codes = new Set();
-            (data.one_hop_routes || []).forEach(hop => {
-                const via = getViaAirportFromHop(hop);
-                if (!via) return;
-                const code = (via.iata || via.icao || "").toUpperCase();
-                if (code) codes.add(code);
-            });
-            codes.delete("");
-            return codes;
-        }
-
-        function renderLayoverFilterBar(data, subset) {
-          layoverFilters.innerHTML = "";
-
-          let codes;
-
-          if (Array.isArray(subset)) {
-            // Build layover set from just the subset of hops
-            const s = new Set();
-            subset.forEach(hop => {
-              const via = getViaAirportFromHop(hop);
-              if (!via) return;
-              const code = (via.iata || via.icao || "").toUpperCase();
-              if (code) s.add(code);
-            });
-            s.delete("");
-            codes = s;
-          } else {
-            // Fallback: all hops
-            codes = collectLayoverCodesFromOneHop(data);
-          }
-
-          if (!codes || !codes.size) {
-            activeLayoverFilter = null;
-            return;
-          }
-
-          // If the current layover filter no longer exists in this subset, clear it
-          if (activeLayoverFilter && !codes.has(activeLayoverFilter)) {
-            activeLayoverFilter = null;
-          }
-
-          // “All layovers” pill
-          const allBtn = document.createElement("button");
-          allBtn.textContent = "All layovers";
-          allBtn.className = "filter-pill" + (activeLayoverFilter ? "" : " active");
-          allBtn.onclick = function () {
-            activeLayoverFilter = null;
-            renderLastResults();
-          };
-          layoverFilters.appendChild(allBtn);
-
-          // One pill per layover code
-          Array.from(codes).sort().forEach(code => {
-            const btn = document.createElement("button");
-            btn.textContent = code;
-            btn.className =
-              "filter-pill" + (activeLayoverFilter === code ? " active" : "");
-            btn.onclick = function () {
-              activeLayoverFilter =
-                activeLayoverFilter === code ? null : code;
-              renderLastResults();
-            };
-            layoverFilters.appendChild(btn);
-          });
-        }
-        
-        function renderAirlineFilterBar(mode, data, subset) {
-            airlineFilters.innerHTML = "";
-
-            let codes;
-
-            if (mode === "direct") {
-                // subset is an optional array of direct flights
-                if (Array.isArray(subset)) {
-                    const s = new Set();
-                    subset.forEach(f => {
-                        s.add(getAirlineCodeFromObj((f && f.airline) || {}));
+                
+                    // STUDENT tab: toggle open/closed
+                    studentTab.addEventListener("click", () => {
+                      if (studentOpen) {
+                        // close student panel
+                        studentOpen = false;
+                        idPanel.style.display = "none";
+                        setActiveTopTab(null);
+                        return;
+                      }
+                
+                      // open student panel, close code panel
+                      studentOpen = true;
+                      codeOpen    = false;
+                      codePanel.style.display = "none";
+                
+                      idPanel.style.display = "block";
+                      setActiveTopTab("student");
+                
+                      if (!idLoaded) {
+                        idPanelStatus.textContent = "Loading…";
+                        idPanelBody.innerHTML = "";
+                        fetch("/id")
+                          .then(resp => {
+                            if (!resp.ok) throw new Error("HTTP " + resp.status);
+                            return resp.json();
+                          })
+                          .then(data => {
+                            idLoaded = true;
+                            idPanelStatus.textContent = "";
+                            idPanelBody.innerHTML =
+                              "<strong>Name:</strong> " + (data.name || "?") + "<br/>" +
+                              "<strong>Student ID:</strong> " + (data.student_id || "?");
+                          })
+                          .catch(err => {
+                            console.error(err);
+                            idPanelStatus.textContent = "Could not load student info.";
+                          });
+                      }
                     });
-                    s.delete("");
-                    codes = s;
-                } else {
-                    codes = collectAirlineCodesFromDirect(data);
-                }
-            } else {
-                // "onehop"
-                if (Array.isArray(subset)) {
-                    const s = new Set();
-                    subset.forEach(hop => {
-                        const first  = hop.first_leg  || {};
-                        const second = hop.second_leg || {};
-                        s.add(getAirlineCodeFromObj(first.airline  || {}));
-                        s.add(getAirlineCodeFromObj(second.airline || {}));
+                
+                    // CODE tab: toggle open/closed, show /code in scrollable <pre>
+                    codeTab.addEventListener("click", () => {
+                      if (codeOpen) {
+                        // close code panel
+                        codeOpen = false;
+                        codePanel.style.display = "none";
+                        setActiveTopTab(null);
+                        return;
+                      }
+                
+                      // open code panel, close student panel
+                      codeOpen    = true;
+                      studentOpen = false;
+                      idPanel.style.display = "none";
+                
+                      codePanel.style.display = "block";
+                      setActiveTopTab("code");
+                
+                      if (!codeLoaded) {
+                        codePanelStatus.textContent = "Loading code…";
+                        codePanelBody.textContent = "";
+                
+                        fetch("/code")
+                          .then(resp => {
+                            if (!resp.ok) throw new Error("HTTP " + resp.status);
+                            return resp.text();
+                          })
+                          .then(text => {
+                            codeLoaded = true;
+                            codePanelStatus.textContent = "";
+                            codePanelBody.textContent = text;  // goes into the <pre>
+                          })
+                          .catch(err => {
+                            console.error(err);
+                            codePanelStatus.textContent = "Could not load code.";
+                          });
+                      }
                     });
-                    s.delete("");
-                    codes = s;
-                } else {
-                    codes = collectAirlineCodesFromOneHop(data);
+                    const form = document.getElementById("route-form");
+                    const srcInput = document.getElementById("src");
+                    const dstInput = document.getElementById("dst");
+                    const srcSuggestions = document.getElementById("src-suggestions");
+                    const dstSuggestions = document.getElementById("dst-suggestions");
+                    const limitInput = document.getElementById("limit");
+                    const recommendedInput = document.getElementById("recommended");
+                    const directButton = document.getElementById("direct-button");
+                    const errorEl = document.getElementById("error");
+                    const resultsList = document.getElementById("resultsList");
+                    const airlineFilters = document.getElementById("airlineFilters");
+                    const viewModeTabs = document.getElementById("viewModeTabs");
+                    const viewTabButtons = viewModeTabs.querySelectorAll(".view-tab");
+                    const layoverFilters = document.getElementById("layoverFilters");
+                    const clearFiltersBtn = document.getElementById("clearFiltersBtn");
+                    
+                // "cards" or "json"
+                    let viewMode = "cards";
+                
+                    // --- Aircraft code → human-readable name mapping (common types) ---
+                    const AIRCRAFT_NAMES = {
+                        // Airbus
+                        "318": "Airbus A318",
+                        "319": "Airbus A319",
+                        "320": "Airbus A320",
+                        "321": "Airbus A321",
+                        "332": "Airbus A330-200",
+                        "333": "Airbus A330-300",
+                        "388": "Airbus A380-800",
+                
+                        // Boeing narrow-body
+                        "732": "Boeing 737-200",
+                        "733": "Boeing 737-300",
+                        "734": "Boeing 737-400",
+                        "735": "Boeing 737-500",
+                        "736": "Boeing 737-600",
+                        "737": "Boeing 737-700",
+                        "738": "Boeing 737-800",
+                        "739": "Boeing 737-900",
+                        "73G": "Boeing 737-700",
+                        "73W": "Boeing 737-700 (winglets)",
+                
+                        // Boeing wide-body (some common ones)
+                        "744": "Boeing 747-400",
+                        "752": "Boeing 757-200",
+                        "753": "Boeing 757-300",
+                        "762": "Boeing 767-200",
+                        "763": "Boeing 767-300",
+                        "764": "Boeing 767-400",
+                        "772": "Boeing 777-200",
+                        "773": "Boeing 777-300",
+                        "77W": "Boeing 777-300ER",
+                        "788": "Boeing 787-8",
+                        "789": "Boeing 787-9",
+                        "78X": "Boeing 787-10",
+                
+                        // Regional jets / turboprops (a small sample)
+                        "CR2": "Bombardier CRJ200",
+                        "CR7": "Bombardier CRJ700",
+                        "CR9": "Bombardier CRJ900",
+                        "E70": "Embraer 170",
+                        "E75": "Embraer 175",
+                        "E90": "Embraer 190",
+                        "DH3": "De Havilland Canada DHC-8-300",
+                        "DH4": "De Havilland Canada DHC-8-400"
+                        // anything not listed will just show its raw code
+                    };
+                
+                    // Turn "738 320 319 739 73G" → "Boeing 737-800, Airbus A320, Airbus A319, Boeing 737-900, Boeing 737-700"
+                    function formatEquipment(equipmentStr) {
+                        if (!equipmentStr) return "";
+                        const seen = new Set();
+                        const labels = [];
+                
+                        equipmentStr.split(/\s+/).forEach(code => {
+                            if (!code) return;
+                            if (seen.has(code)) return;      // dedupe
+                            seen.add(code);
+                            const label = AIRCRAFT_NAMES[code] || code;  // fallback to raw code if unknown
+                            labels.push(label);
+                        });
+                
+                        return labels.join(", ");
+                    }
+                    // Remember last results so we can re-render when filter changes
+                    let lastMode = null;          // "direct" | "onehop" | null
+                    let lastDirectData = null;    // JSON from /direct
+                    let lastOneHopData = null;    // JSON from /onehop
+                    let activeAirlineFilter = null; // e.g. "AA" or null for "all"
+                    let activeLayoverFilter = null;  // NEW: currently selected via airport, e.g. "DEN"
+                    let focusedRouteId = null;    // e.g. "onehop-3" or "direct-0"
+                
+                    /** Normalize airline code from an airline object */
+                    function getAirlineCodeFromObj(airlineObj) {
+                        if (!airlineObj) return "";
+                        const code = airlineObj.iata || airlineObj.icao || airlineObj.code || "";
+                        return code ? code.toUpperCase() : "";
+                    }
+                
+                    function setError(msg) {
+                        errorEl.textContent = msg || "";
+                    }
+                function applyRouteFocusToCards() {
+                    const cards = document.querySelectorAll('.route-card');
+                    if (!cards.length) return;
+
+                    cards.forEach(card => {
+                        const isFocused = focusedRouteId && card.dataset.routeId === focusedRouteId;
+                        if (!focusedRouteId || isFocused) {
+                            card.style.display = '';   // show
+                        } else {
+                            card.style.display = 'none'; // hide others
+                        }
+                        card.classList.toggle('selected', isFocused);
+                    });
                 }
-            }
 
-            if (!codes || !codes.size) {
-                activeAirlineFilter = null;
-                return; // nothing to filter on
-            }
-            // If current airline filter is not present in this subset, clear it
-                if (activeAirlineFilter && !codes.has(activeAirlineFilter)) {
-                    activeAirlineFilter = null;
+                function clearRouteFocus() {
+                    focusedRouteId = null;
+                    const cards = document.querySelectorAll('.route-card');
+                    cards.forEach(card => {
+                        card.style.display = '';
+                        card.classList.remove('selected');
+                    });
                 }
+                /** From a one-hop route object, return the via airport (if any). */
+                function getViaAirportFromHop(hop) {
+                    if (!hop) return null;
 
-            // “All airlines” pill
-            const allBtn = document.createElement("button");
-            allBtn.textContent = "All airlines";
-            allBtn.className = "filter-pill" + (activeAirlineFilter ? "" : " active");
-            allBtn.onclick = function () {
-                activeAirlineFilter = null;
-                renderLastResults();
-            };
-            airlineFilters.appendChild(allBtn);
+                    // Your JSON likely uses hop.via, but be defensive:
+                    if (hop.via) return hop.via;
+                    if (hop.via_airport) return hop.via_airport;
+                    if (hop.viaAirport) return hop.viaAirport;
 
-            // One pill per airline code
-            Array.from(codes).sort().forEach(code => {
-                const btn = document.createElement("button");
-                btn.textContent = code;
-                btn.className = "filter-pill" + (activeAirlineFilter === code ? " active" : "");
-                btn.onclick = function () {
-                    activeAirlineFilter = (activeAirlineFilter === code ? null : code);
-                    renderLastResults();
-                };
-                airlineFilters.appendChild(btn);
-            });
-        }
-        
-        function renderLastResults() {
-            if (lastMode === "direct" && lastDirectData) {
-                renderNonstopResults(lastDirectData); // will read activeAirlineFilter
-            } else if (lastMode === "onehop" && lastOneHopData) {
-                renderOneHopResults(lastOneHopData);  // same
-            }
-        }
-        
-            // ----- Render helpers -----
-        
-            function renderNonstopResults(data) {
-                lastMode = "direct";
-                lastDirectData = data;
-        
-                clearResults();
-                renderAirlineFilterBar("direct", data);
-        
-                const src = data.source;
-                const dst = data.destination;
-                const allFlights = data.direct_flights || [];
-        
-                // Apply airline filter (if set)
-                const flights = allFlights.filter(f => {
-                    if (!activeAirlineFilter) return true;
-                    const code = getAirlineCodeFromObj(f.airline || {});
-                    return code === activeAirlineFilter;
-                });
-        
-                if (!flights.length) {
-                    const msg = activeAirlineFilter
-                        ? "No non-stop routes for " + activeAirlineFilter +
-                          " on this city pair. Try another airline or 'All airlines'."
-                        : "No non-stop routes found between " +
-                          (src.iata || "???") + " and " + (dst.iata || "???") + ".";
-                    resultsList.innerHTML = '<p class="no-results">' + msg + '</p>';
-                    return;
+                    return null;
                 }
                 
-                // NEW: Render all available routes on the map before showing cards
-                                renderRoutesOnHomeMap('direct', data, flights); // Pass original data before filtering!
-                flights.forEach(function (flight, index) {
-                    const airlineObj = flight.airline || {};
-                    const codeshare = !!flight.codeshare;
-                    const equipmentLabel = formatEquipment(flight.equipment || "");
-                    const equipment = equipmentLabel ? ("Aircraft: " + equipmentLabel) : "";        
-                    // Build airline pill with logo
-                    const airlinePill = createAirlinePill(airlineObj);
-        
-                    const card = document.createElement("div");
-                    card.className = "route-card";
-      
-                            card.className = "route-card clickable"; // Added 'clickable' class
-                            
-                            // NEW: Set the route ID and event listener
-                            card.dataset.routeId = 'direct-' + index;
-                            card.addEventListener('click', () => {
-                                highlightRoute(card.dataset.routeId);
+                    function clearResults() {
+                        resultsList.innerHTML = "";
+                    }
+                
+                    function extractIataFromInput(inputEl) {
+                                    const raw = (inputEl.value || "").trim().toUpperCase();
+                                    if (!raw) return "";
+                
+                                    // If it ends in "(XXX)" grab XXX
+                                    const m = raw.match(/\(([A-Z0-9]{3})\)\s*$/);
+                                    if (m) return m[1];
+                
+                                    // If the whole thing is a 3-letter code, use it
+                                    if (/^[A-Z0-9]{3}$/.test(raw)) return raw;
+                
+                                    // Fallback: just return whatever (so old behavior still sort-of works)
+                                    return raw;
+                                }
+                
+                                function getSrcDstOrError() {
+                                    const src = extractIataFromInput(srcInput);
+                                    const dst = extractIataFromInput(dstInput);
+                                    if (!src || !dst) {
+                                        setError("Please enter both source and destination IATA codes.");
+                                        return null;
+                                    }
+                                    return { src, dst };
+                                }
+                //helper func
+                function updateViewModeTabs() {
+                    viewTabButtons.forEach(btn => {
+                        const mode = btn.getAttribute("data-mode");
+                        if (mode === viewMode) {
+                            btn.classList.add("active");
+                        } else {
+                            btn.classList.remove("active");
+                        }
+                    });
+                }
+                // --- Airline logo helpers ---
+                
+                    function getAirlineLogoUrl(code) {
+                        if (!code || code === "\\N") {
+                            // Simple placeholder for unknown codes
+                            return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
+                        }
+                        // Kiwi has a nice simple pattern for airline logos by IATA code
+                        return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
+                    }
+                
+                    function createAirlinePill(airlineObj) {
+                        const name  = airlineObj.name || airlineObj.code || "Unknown airline";
+                        const code  = airlineObj.iata || airlineObj.icao || airlineObj.code || "";
+                        const label = code ? (name + " (" + code + ")") : name;
+                
+                        const pill = document.createElement("span");
+                        pill.className = "airline-pill";
+                
+                        const logo = document.createElement("img");
+                        logo.src = getAirlineLogoUrl(airlineObj.iata || airlineObj.icao || "");
+                        logo.alt = label + " logo";
+                        logo.onerror = function () {
+                            // Hide logo if the image 404s
+                            this.style.display = "none";
+                        };
+                
+                        pill.appendChild(logo);
+                        pill.appendChild(document.createTextNode(label));
+                        return pill;
+                    }
+                
+                function collectAirlineCodesFromDirect(data) {
+                    const codes = new Set();
+                    (data.direct_flights || []).forEach(f => {
+                        codes.add(getAirlineCodeFromObj(f.airline || {}));
+                    });
+                    codes.delete(""); // remove empty
+                    return codes;
+                }
+                
+                function collectAirlineCodesFromOneHop(data) {
+                    const codes = new Set();
+                    (data.one_hop_routes || []).forEach(hop => {
+                        const first = hop.first_leg || {};
+                        const second = hop.second_leg || {};
+                        codes.add(getAirlineCodeFromObj(first.airline || {}));
+                        codes.add(getAirlineCodeFromObj(second.airline || {}));
+                    });
+                    codes.delete("");
+                    return codes;
+                }
+                function collectLayoverCodesFromOneHop(data) {
+                    const codes = new Set();
+                    (data.one_hop_routes || []).forEach(hop => {
+                        const via = getViaAirportFromHop(hop);
+                        if (!via) return;
+                        const code = (via.iata || via.icao || "").toUpperCase();
+                        if (code) codes.add(code);
+                    });
+                    codes.delete("");
+                    return codes;
+                }
+
+                function renderLayoverFilterBar(data, subset) {
+                  layoverFilters.innerHTML = "";
+
+                  let codes;
+
+                  if (Array.isArray(subset)) {
+                    // Build layover set from just the subset of hops
+                    const s = new Set();
+                    subset.forEach(hop => {
+                      const via = getViaAirportFromHop(hop);
+                      if (!via) return;
+                      const code = (via.iata || via.icao || "").toUpperCase();
+                      if (code) s.add(code);
+                    });
+                    s.delete("");
+                    codes = s;
+                  } else {
+                    // Fallback: all hops
+                    codes = collectLayoverCodesFromOneHop(data);
+                  }
+
+                  if (!codes || !codes.size) {
+                    activeLayoverFilter = null;
+                    return;
+                  }
+
+                  // If the current layover filter no longer exists in this subset, clear it
+                  if (activeLayoverFilter && !codes.has(activeLayoverFilter)) {
+                    activeLayoverFilter = null;
+                  }
+
+                  // “All layovers” pill
+                  const allBtn = document.createElement("button");
+                  allBtn.textContent = "All layovers";
+                  allBtn.className = "filter-pill" + (activeLayoverFilter ? "" : " active");
+                  allBtn.onclick = function () {
+                    activeLayoverFilter = null;
+                    renderLastResults();
+                  };
+                  layoverFilters.appendChild(allBtn);
+
+                  // One pill per layover code
+                  Array.from(codes).sort().forEach(code => {
+                    const btn = document.createElement("button");
+                    btn.textContent = code;
+                    btn.className =
+                      "filter-pill" + (activeLayoverFilter === code ? " active" : "");
+                    btn.onclick = function () {
+                      activeLayoverFilter =
+                        activeLayoverFilter === code ? null : code;
+                      renderLastResults();
+                    };
+                    layoverFilters.appendChild(btn);
+                  });
+                }
+                
+                function renderAirlineFilterBar(mode, data, subset) {
+                    airlineFilters.innerHTML = "";
+
+                    let codes;
+
+                    if (mode === "direct") {
+                        // subset is an optional array of direct flights
+                        if (Array.isArray(subset)) {
+                            const s = new Set();
+                            subset.forEach(f => {
+                                s.add(getAirlineCodeFromObj((f && f.airline) || {}));
                             });
-        
-                    card.innerHTML =
-                        '<div class="route-main-line">' +
+                            s.delete("");
+                            codes = s;
+                        } else {
+                            codes = collectAirlineCodesFromDirect(data);
+                        }
+                    } else {
+                        // "onehop"
+                        if (Array.isArray(subset)) {
+                            const s = new Set();
+                            subset.forEach(hop => {
+                                const first  = hop.first_leg  || {};
+                                const second = hop.second_leg || {};
+                                s.add(getAirlineCodeFromObj(first.airline  || {}));
+                                s.add(getAirlineCodeFromObj(second.airline || {}));
+                            });
+                            s.delete("");
+                            codes = s;
+                        } else {
+                            codes = collectAirlineCodesFromOneHop(data);
+                        }
+                    }
+
+                    if (!codes || !codes.size) {
+                        activeAirlineFilter = null;
+                        return; // nothing to filter on
+                    }
+                    // If current airline filter is not present in this subset, clear it
+                        if (activeAirlineFilter && !codes.has(activeAirlineFilter)) {
+                            activeAirlineFilter = null;
+                        }
+
+                    // “All airlines” pill
+                    const allBtn = document.createElement("button");
+                    allBtn.textContent = "All airlines";
+                    allBtn.className = "filter-pill" + (activeAirlineFilter ? "" : " active");
+                    allBtn.onclick = function () {
+                        activeAirlineFilter = null;
+                        renderLastResults();
+                    };
+                    airlineFilters.appendChild(allBtn);
+
+                    // One pill per airline code
+                    Array.from(codes).sort().forEach(code => {
+                        const btn = document.createElement("button");
+                        btn.textContent = code;
+                        btn.className = "filter-pill" + (activeAirlineFilter === code ? " active" : "");
+                        btn.onclick = function () {
+                            activeAirlineFilter = (activeAirlineFilter === code ? null : code);
+                            renderLastResults();
+                        };
+                        airlineFilters.appendChild(btn);
+                    });
+                }
+                
+                function renderLastResults() {
+                    if (lastMode === "direct" && lastDirectData) {
+                        renderNonstopResults(lastDirectData); // will read activeAirlineFilter
+                    } else if (lastMode === "onehop" && lastOneHopData) {
+                        renderOneHopResults(lastOneHopData);  // same
+                    }
+                }
+                
+                    // ----- Render helpers -----
+                
+                    function renderNonstopResults(data) {
+                        lastMode = "direct";
+                        lastDirectData = data;
+
+                        clearResults();
+                        // 🔵 Non-stop mode: hide any leftover layover filters
+                            activeLayoverFilter = null;
+                            layoverFilters.innerHTML = "";
+
+
+                        // Build airline chips from *all* direct flights
+                        renderAirlineFilterBar("direct", data);
+
+                        const src = data.source;
+                        const dst = data.destination;
+                        const allFlights = data.direct_flights || [];
+
+                        // Apply airline filter (if set)
+                        const flights = allFlights.filter(f => {
+                            if (!activeAirlineFilter) return true;
+                            const code = getAirlineCodeFromObj(f.airline || {});
+                            return code === activeAirlineFilter;
+                        });
+
+                        if (!flights.length) {
+                            const msg = activeAirlineFilter
+                                ? "No non-stop routes for " + activeAirlineFilter +
+                                  " on this city pair. Try another airline or 'All airlines'."
+                                : "No non-stop routes found between " +
+                                  (src.iata || "???") + " and " + (dst.iata || "???") + ".";
+                            resultsList.innerHTML = '<p class="no-results">' + msg + '</p>';
+                            clearHomeMap();
+                            return;
+                        }
+
+                        // Draw just the filtered flights on the map
+                        renderRoutesOnHomeMap("direct", data, flights);
+
+                        flights.forEach(function (flight, index) {
+                            const airlineObj     = flight.airline || {};
+                            const codeshare      = !!flight.codeshare;
+                            const equipmentLabel = formatEquipment(flight.equipment || "");
+                            const equipment      = equipmentLabel ? ("Aircraft: " + equipmentLabel) : "";
+
+                            const airlinePill = createAirlinePill(airlineObj);
+
+                            const card = document.createElement("div");
+                            card.className = "route-card clickable";
+
+                            // For non-stop routes, ids are "direct-0", "direct-1", ...
+                            const id = "direct-" + index;
+                            card.dataset.routeId = id;
+
+                            card.addEventListener("click", () => {
+                                highlightRoute(id);
+                                if (focusedRouteId === id) {
+                                    // Clicking again clears focus
+                                    clearRouteFocus();
+                                } else {
+                                    focusedRouteId = id;
+                                    applyRouteFocusToCards();
+                                }
+                            });
+
+                            card.innerHTML =
+                                '<div class="route-main-line">' +
+                                  '<span class="route-city">' + src.city + ' (' + src.iata + ')</span>' +
+                                  '<span class="route-arrow">→</span>' +
+                                  '<span class="route-city">' + dst.city + ' (' + dst.iata + ')</span>' +
+                                  '<span class="route-tag nonstop">Nonstop</span>' +
+                                '</div>' +
+                                '<div class="route-sub-line">' +
+                                  '<span class="__airline-pill-slot"></span>' +
+                                  (codeshare ? '<span class="route-tag codeshare">Codeshare</span>' : '') +
+                                  (equipment ? '<span>' + equipment + '</span>' : '') +
+                                '</div>';
+
+                            resultsList.appendChild(card);
+                            card.querySelector(".__airline-pill-slot").replaceWith(airlinePill);
+                        });
+
+                        // Re-apply focus styling/visibility after rebuilding cards
+                        applyRouteFocusToCards();
+                    }
+                
+                function renderOneHopResults(data) {
+                    lastMode      = "onehop";
+                    lastOneHopData = data;
+
+                    clearResults();
+
+                    const src     = data.source || {};
+                    const dst     = data.destination || {};
+                    const allHops = data.one_hop_routes || [];
+
+                    // Start from all hops
+                    let hops = allHops;
+
+                    // 1) Airline filter
+                    if (activeAirlineFilter) {
+                        hops = hops.filter(hop => {
+                            const first  = hop.first_leg  || {};
+                            const second = hop.second_leg || {};
+                            const c1 = getAirlineCodeFromObj(first.airline  || {});
+                            const c2 = getAirlineCodeFromObj(second.airline || {});
+                            return c1 === activeAirlineFilter || c2 === activeAirlineFilter;
+                        });
+                    }
+
+                    // 2) Layover filter
+                    if (activeLayoverFilter) {
+                        hops = hops.filter(hop => {
+                            const via = getViaAirportFromHop(hop);
+                            const viaCode = (via && (via.iata || via.icao)) || "";
+                            return viaCode === activeLayoverFilter;
+                        });
+                    }
+
+                    // 3) Rebuild chip bars from the *final* subset
+                    renderLayoverFilterBar(data, hops);
+                    renderAirlineFilterBar("onehop", data, hops);
+
+                    // 4) Map + "no results" handling
+                    renderRoutesOnHomeMap("onehop", data, hops);
+
+                    if (!hops.length) {
+                        const baseMsg = "No one-hop routes found between " +
+                          (src.iata || "???") + " and " + (dst.iata || "???") + ".";
+                        resultsList.innerHTML =
+                          '<p class="no-results">' + baseMsg + '</p>';
+                        clearHomeMap();
+                        return;
+                    }
+
+                    // 5) Build cards
+                    hops.forEach(function (hop, index) {
+                        const via    = getViaAirportFromHop(hop);
+                        const first  = hop.first_leg  || {};
+                        const second = hop.second_leg || {};
+
+                        const sameAirline  = !!hop.same_airline;
+                        const hasCodeshare = !!hop.has_codeshare;
+                        const distance     = hop.total_distance_miles.toFixed(0);
+
+                        const firstAirlinePill  = createAirlinePill(first.airline  || {});
+                        const secondAirlinePill = createAirlinePill(second.airline || {});
+
+                        const firstEquipLabel  = formatEquipment(first.equipment  || "");
+                        const secondEquipLabel = formatEquipment(second.equipment || "");
+
+                        let badgesHtml = "";
+                        if (sameAirline) {
+                            badgesHtml += '<span class="route-tag same-airline">Same airline both legs</span>';
+                        } else {
+                            badgesHtml += '<span class="route-tag mixed-airlines">Mixed airlines</span>';
+                        }
+                        if (hasCodeshare) {
+                            badgesHtml += '<span class="route-tag codeshare">Codeshare on one or more legs</span>';
+                        }
+
+                        const card = document.createElement("div");
+                        card.className = "route-card clickable";
+
+                        // For one-hops, ids are "onehop-0", "onehop-1", ...
+                        const id = "onehop-" + index;
+                        card.dataset.routeId = id;
+
+                        card.addEventListener("click", () => {
+                            highlightRoute(id);
+                            if (focusedRouteId === id) {
+                                clearRouteFocus();
+                            } else {
+                                focusedRouteId = id;
+                                applyRouteFocusToCards();
+                            }
+                        });
+
+                        card.innerHTML =
+                          '<div class="route-main-line">' +
                             '<span class="route-city">' + src.city + ' (' + src.iata + ')</span>' +
                             '<span class="route-arrow">→</span>' +
                             '<span class="route-city">' + dst.city + ' (' + dst.iata + ')</span>' +
-                            '<span class="route-tag nonstop">Nonstop</span>' +
-                        '</div>' +
-                        '<div class="route-sub-line">' +
-                            '<span class="__airline-pill-slot"></span>' +
-                            (codeshare ? '<span class="route-tag codeshare">Codeshare</span>' : '') +
-                            (equipment ? '<span>' + equipment + '</span>' : '') +
-                        '</div>';
-        
-                    resultsList.appendChild(card);
-                    card.querySelector(".__airline-pill-slot").replaceWith(airlinePill);
+                            '<span class="route-tag onehop">1 stop via ' +
+                              (via ? (via.city + ' (' + (via.iata || via.icao || '') + ')') : '—') +
+                            '</span>' +
+                            '<span class="route-distance">' + distance + ' mi</span>' +
+                          '</div>' +
+                          '<div class="route-sub-line">' +
+                            badgesHtml +
+                          '</div>' +
+                          '<div class="route-sub-line" style="gap: 1rem;">' +
+                            '<span style="display:flex;align-items:center;gap:0.25rem;">' +
+                              '1st leg: <span class="__first-pill-slot"></span>' +
+                              (firstEquipLabel ? ' · <span>Aircraft: ' + firstEquipLabel + '</span>' : '') +
+                            '</span>' +
+                            '<span style="display:flex;align-items:center;gap:0.25rem;">' +
+                              '2nd leg: <span class="__second-pill-slot"></span>' +
+                              (secondEquipLabel ? ' · <span>Aircraft: ' + secondEquipLabel + '</span>' : '') +
+                            '</span>' +
+                          '</div>';
+
+                        resultsList.appendChild(card);
+                        card.querySelector(".__first-pill-slot").replaceWith(firstAirlinePill);
+                        card.querySelector(".__second-pill-slot").replaceWith(secondAirlinePill);
+                    });
+
+                    applyRouteFocusToCards();
+                }
+                
+                function renderForCurrentMode() {
+                    if (viewMode === "json") {
+                        renderJsonView();
+                    } else {
+                        // Default: cards
+                        renderLastResults();
+                    }
+                }
+                
+                viewTabButtons.forEach(btn => {
+                    btn.addEventListener("click", () => {
+                        const mode = btn.getAttribute("data-mode");
+                        if (mode === viewMode) return;
+                        viewMode = mode;
+                        updateViewModeTabs();
+                        renderForCurrentMode();
+                    });
                 });
-            }
-        
-        function renderOneHopResults(data) {
-          lastMode = "onehop";
-          lastOneHopData = data;
-
-          clearResults();
-
-          const src = data.source || {};
-          const dst = data.destination || {};
-          const allHops = data.one_hop_routes || [];
-
-          // Start from all hops
-          let hops = allHops;
-
-          // 1) Apply airline filter first (so airports only show where that airline flies)
-          if (activeAirlineFilter) {
-            hops = hops.filter(hop => {
-              const first  = hop.first_leg  || {};
-              const second = hop.second_leg || {};
-              const c1 = getAirlineCodeFromObj(first.airline  || {});
-              const c2 = getAirlineCodeFromObj(second.airline || {});
-              return c1 === activeAirlineFilter || c2 === activeAirlineFilter;
-            });
-          }
-
-          // 2) Then apply layover filter (if any)
-          if (activeLayoverFilter) {
-            hops = hops.filter(hop => {
-              const via = getViaAirportFromHop(hop);
-              const viaCode = (via && (via.iata || via.icao)) || "";
-              return viaCode === activeLayoverFilter;
-            });
-          }
-
-          // 3) Rebuild BOTH chip bars from the final subset of hops
-          renderLayoverFilterBar(data, hops);           // airports only where current airline flies
-          renderAirlineFilterBar("onehop", data, hops); // airlines that still exist with current layover
-
-          // 4) Map + "no results" handling
-          renderRoutesOnHomeMap("onehop", data, hops);
-
-          if (!hops.length) {
-            const baseMsg = "No one-hop routes found between " +
-              (src.iata || "???") + " and " + (dst.iata || "???") + ".";
-            resultsList.innerHTML =
-              '<p class="no-results">' + baseMsg + '</p>';
-            clearHomeMap();
-            return;
-          }
-
-          // 5) Build the cards from `hops`
-          hops.forEach(function (hop, index) {
-            const via    = getViaAirportFromHop(hop);  // <— use helper so via is always found
-            const first  = hop.first_leg || {};
-            const second = hop.second_leg || {};
-
-            const sameAirline  = !!hop.same_airline;
-            const hasCodeshare = !!hop.has_codeshare;
-            const distance     = hop.total_distance_miles.toFixed(0);
-
-            const firstAirlinePill  = createAirlinePill(first.airline  || {});
-            const secondAirlinePill = createAirlinePill(second.airline || {});
-
-            const firstEquipLabel  = formatEquipment(first.equipment  || "");
-            const secondEquipLabel = formatEquipment(second.equipment || "");
-
-            let badgesHtml = "";
-            if (sameAirline) {
-              badgesHtml += '<span class="route-tag same-airline">Same airline both legs</span>';
-            } else {
-              badgesHtml += '<span class="route-tag mixed-airlines">Mixed airlines</span>';
-            }
-            if (hasCodeshare) {
-              badgesHtml += '<span class="route-tag codeshare">Codeshare on one or more legs</span>';
-            }
-
-            const card = document.createElement("div");
-            card.className = "route-card clickable";
-            card.dataset.routeId = 'onehop-' + index;
-            card.addEventListener('click', () => {
-              highlightRoute(card.dataset.routeId);
-            });
-
-            card.innerHTML =
-              '<div class="route-main-line">' +
-                '<span class="route-city">' + src.city + ' (' + src.iata + ')</span>' +
-                '<span class="route-arrow">→</span>' +
-                '<span class="route-city">' + dst.city + ' (' + dst.iata + ')</span>' +
-                '<span class="route-tag onehop">1 stop via ' +
-                  (via ? (via.city + ' (' + (via.iata || via.icao || '') + ')') : '—') +
-                '</span>' +
-                '<span class="route-distance">' + distance + ' mi</span>' +
-              '</div>' +
-              '<div class="route-sub-line">' +
-                badgesHtml +
-              '</div>' +
-              '<div class="route-sub-line" style="gap: 1rem;">' +
-                '<span style="display:flex;align-items:center;gap:0.25rem;">' +
-                  '1st leg: <span class="__first-pill-slot"></span>' +
-                  (firstEquipLabel ? ' · <span>Aircraft: ' + firstEquipLabel + '</span>' : '') +
-                '</span>' +
-                '<span style="display:flex;align-items:center;gap:0.25rem;">' +
-                  '2nd leg: <span class="__second-pill-slot"></span>' +
-                  (secondEquipLabel ? ' · <span>Aircraft: ' + secondEquipLabel + '</span>' : '') +
-                '</span>' +
-              '</div>';
-
-            resultsList.appendChild(card);
-            card.querySelector(".__first-pill-slot").replaceWith(firstAirlinePill);
-            card.querySelector(".__second-pill-slot").replaceWith(secondAirlinePill);
-          });
-        }
-        function renderForCurrentMode() {
-            if (viewMode === "json") {
-                renderJsonView();
-            } else {
-                // Default: cards
-                renderLastResults();
-            }
-        }
-        
-        viewTabButtons.forEach(btn => {
-            btn.addEventListener("click", () => {
-                const mode = btn.getAttribute("data-mode");
-                if (mode === viewMode) return;
-                viewMode = mode;
-                updateViewModeTabs();
-                renderForCurrentMode();
-            });
-        });
-        
-        function renderJsonView() {
-            clearResults();
-        
-            if (!lastMode) {
-                resultsList.innerHTML =
-                    '<p class="no-results">(run a search to see JSON)</p>';
-                return;
-            }
-        
-            const data = (lastMode === "direct") ? lastDirectData : lastOneHopData;
-            if (!data) {
-                resultsList.innerHTML =
-                    '<p class="no-results">(no data available yet)</p>';
-                return;
-            }
-        
-            // Show raw JSON, pretty-printed; basic escaping of "<"
-            const jsonStr = JSON.stringify(data, null, 2).replace(/</g, "&lt;");
-        
-            // We can keep the airline filter bar, or clear it; your choice.
-            // For now, clear filters so the JSON area has more room:
-            airlineFilters.innerHTML = "";
-        
-            resultsList.innerHTML =
-                '<pre style="background:#020617;color:#e5e7eb;' +
-                'padding:0.75rem;border-radius:0.5rem;font-size:0.8rem;' +
-                'overflow:auto;max-height:24rem;">' +
-                jsonStr +
-                '</pre>';
-        }
-        
-         // --- Autocomplete helpers ---
-        
-                    let activeList = null;
-                    let activeIndex = -1;
-        
-                    async function fetchAirportSuggestions(query) {
-                        if (!query || query.length < 2) return [];
-                        try {
-                            const resp = await fetch("/airports/search?q=" + encodeURIComponent(query) + "&limit=8");
-                            if (!resp.ok) return [];
-                            return await resp.json();
-                        } catch (e) {
-                            console.error("autocomplete fetch error", e);
-                            return [];
-                        }
+                
+                function renderJsonView() {
+                    clearResults();
+                
+                    if (!lastMode) {
+                        resultsList.innerHTML =
+                            '<p class="no-results">(run a search to see JSON)</p>';
+                        return;
                     }
-        
-                    function renderSuggestions(airports, inputEl, listEl) {
-                        listEl.innerHTML = "";
-                        activeList = listEl;
-                        activeIndex = -1;
-        
-                        if (!airports.length) {
-                            listEl.innerHTML = '<div class="autocomplete-empty">No matching airports</div>';
-                            listEl.style.display = "block";
-                            return;
-                        }
-        
-                        airports.forEach((ap, idx) => {
-                            const div = document.createElement("div");
-                            div.className = "autocomplete-item";
-                            const display = ap.display || (ap.city + ", " + ap.country + " (" + ap.code + ")");
-                            div.textContent = display;
-                            div.dataset.code = ap.code;
-        
-                            div.addEventListener("click", () => {
-                                inputEl.value = display;
-                                listEl.style.display = "none";
+                
+                    const data = (lastMode === "direct") ? lastDirectData : lastOneHopData;
+                    if (!data) {
+                        resultsList.innerHTML =
+                            '<p class="no-results">(no data available yet)</p>';
+                        return;
+                    }
+                
+                    // Show raw JSON, pretty-printed; basic escaping of "<"
+                    const jsonStr = JSON.stringify(data, null, 2).replace(/</g, "&lt;");
+                
+                    // We can keep the airline filter bar, or clear it; your choice.
+                    // For now, clear filters so the JSON area has more room:
+                    airlineFilters.innerHTML = "";
+                
+                    resultsList.innerHTML =
+                        '<pre style="background:#020617;color:#e5e7eb;' +
+                        'padding:0.75rem;border-radius:0.5rem;font-size:0.8rem;' +
+                        'overflow:auto;max-height:24rem;">' +
+                        jsonStr +
+                        '</pre>';
+                }
+                
+                 // --- Autocomplete helpers ---
+                
+                            let activeList = null;
+                            let activeIndex = -1;
+                
+                            async function fetchAirportSuggestions(query) {
+                                if (!query || query.length < 2) return [];
+                                try {
+                                    const resp = await fetch("/airports/search?q=" + encodeURIComponent(query) + "&limit=8");
+                                    if (!resp.ok) return [];
+                                    return await resp.json();
+                                } catch (e) {
+                                    console.error("autocomplete fetch error", e);
+                                    return [];
+                                }
+                            }
+                
+                            function renderSuggestions(airports, inputEl, listEl) {
                                 listEl.innerHTML = "";
-                            });
-        
-                            listEl.appendChild(div);
-                        });
-        
-                        listEl.style.display = "block";
-                    }
-        
-                    async function handleAutocompleteInput(inputEl, listEl) {
-                        const query = (inputEl.value || "").trim();
-                        if (query.length < 2) {
-                            listEl.style.display = "none";
-                            listEl.innerHTML = "";
-                            return;
-                        }
-                        const airports = await fetchAirportSuggestions(query);
-                        // Only render if the text hasn't changed while fetching
-                        if ((inputEl.value || "").trim() === query) {
-                            renderSuggestions(airports, inputEl, listEl);
-                        }
-                    }
-        
-                    function handleAutocompleteKeydown(e, inputEl, listEl) {
-                        if (listEl.style.display === "none") return;
-        
-                        const items = listEl.querySelectorAll(".autocomplete-item");
-                        if (!items.length) return;
-        
-                        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                            e.preventDefault();
-                            if (activeList !== listEl) {
                                 activeList = listEl;
                                 activeIndex = -1;
+                
+                                if (!airports.length) {
+                                    listEl.innerHTML = '<div class="autocomplete-empty">No matching airports</div>';
+                                    listEl.style.display = "block";
+                                    return;
+                                }
+                
+                                airports.forEach((ap, idx) => {
+                                    const div = document.createElement("div");
+                                    div.className = "autocomplete-item";
+                                    const display = ap.display || (ap.city + ", " + ap.country + " (" + ap.code + ")");
+                                    div.textContent = display;
+                                    div.dataset.code = ap.code;
+                
+                                    div.addEventListener("click", () => {
+                                        inputEl.value = display;
+                                        listEl.style.display = "none";
+                                        listEl.innerHTML = "";
+                                    });
+                
+                                    listEl.appendChild(div);
+                                });
+                
+                                listEl.style.display = "block";
                             }
-                            const dir = (e.key === "ArrowDown") ? 1 : -1;
-                            activeIndex = (activeIndex + dir + items.length) % items.length;
-                            items.forEach(el => el.classList.remove("active"));
-                            items[activeIndex].classList.add("active");
-                            items[activeIndex].scrollIntoView({ block: "nearest" });
-                        } else if (e.key === "Enter") {
-                            if (activeIndex >= 0) {
-                                e.preventDefault();
-                                items[activeIndex].click();
+                
+                            async function handleAutocompleteInput(inputEl, listEl) {
+                                const query = (inputEl.value || "").trim();
+                                if (query.length < 2) {
+                                    listEl.style.display = "none";
+                                    listEl.innerHTML = "";
+                                    return;
+                                }
+                                const airports = await fetchAirportSuggestions(query);
+                                // Only render if the text hasn't changed while fetching
+                                if ((inputEl.value || "").trim() === query) {
+                                    renderSuggestions(airports, inputEl, listEl);
+                                }
                             }
-                        } else if (e.key === "Escape") {
-                            listEl.style.display = "none";
-                        }
+                
+                            function handleAutocompleteKeydown(e, inputEl, listEl) {
+                // If the list is hidden, let the event bubble normally.
+                if (listEl.style.display === "none") return;
+
+                const items = listEl.querySelectorAll(".autocomplete-item");
+                if (!items.length) return;
+
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  if (activeList !== listEl) {
+                    activeList = listEl;
+                    activeIndex = -1;
+                  }
+                  const dir = e.key === "ArrowDown" ? 1 : -1;
+                  activeIndex = (activeIndex + dir + items.length) % items.length;
+                  items.forEach(el => el.classList.remove("active"));
+                  items[activeIndex].classList.add("active");
+                  items[activeIndex].scrollIntoView({ block: "nearest" });
+                } else if (e.key === "Enter" || e.key === "Tab") {
+                  // Accept the current selection (or first item if none selected yet)
+                  if (activeIndex < 0) {
+                    activeIndex = 0;
+                  }
+                  const chosen = items[activeIndex];
+                  if (chosen) {
+                    // Don’t submit the form on this Enter – we’re just choosing a suggestion.
+                    if (e.key === "Enter") {
+                      e.preventDefault();
                     }
-                    // Autocomplete wiring
-                    srcInput.addEventListener("input", () => {
-                        handleAutocompleteInput(srcInput, srcSuggestions);
-                    });
-                    dstInput.addEventListener("input", () => {
-                        handleAutocompleteInput(dstInput, dstSuggestions);
-                    });
-        
-                    srcInput.addEventListener("keydown", (e) => {
-                        handleAutocompleteKeydown(e, srcInput, srcSuggestions);
-                    });
-                    dstInput.addEventListener("keydown", (e) => {
-                        handleAutocompleteKeydown(e, dstInput, dstSuggestions);
-                    });
-        
-                    // Hide suggestions when clicking outside
-                    document.addEventListener("click", (e) => {
-                        if (!e.target.closest(".autocomplete-container")) {
-                            srcSuggestions.style.display = "none";
-                            dstSuggestions.style.display = "none";
-                        }
-                    });
-                    // Clear Filters button: reset airline + layover filters and re-render
-                    clearFiltersBtn.addEventListener("click", () => {
-                        activeAirlineFilter = null;
-                        activeLayoverFilter = null;
-                        renderLastResults();
-                    });
-            // ----- Network calls -----
-        
-            form.addEventListener("submit", function (event) {
-                
-                event.preventDefault();
-                setError("");
-                
-                // 🔄 Reset airline filter whenever a new search is run
-                  activeAirlineFilter = null;
-                  airlineFilters.innerHTML = ""; // optional, it'll be repopulated by render
-        
-                activeLayoverFilter = null;
-                layoverFilters.innerHTML = "";
-                
-                errorEl.textContent = "";
-                  resultsList.innerHTML = '<p class="no-results">Loading...</p>';
-
-        
-                const pair = getSrcDstOrError();
-                if (!pair) return;
-                const src = pair.src;
-                const dst = pair.dst;
-        
-                let limit = parseInt((limitInput.value || "").trim(), 10);
-                if (isNaN(limit) || limit <= 0) {
-                    limit = 20;
-                    limitInput.value = "20";
+                    chosen.click();  // sets input value and calls loadAirportDetails/airline
+                  }
+                } else if (e.key === "Escape") {
+                  listEl.style.display = "none";
                 }
-                const recommended = recommendedInput.checked;
-        
-                const params = new URLSearchParams({
-                    src: src,
-                    dst: dst,
-                    limit: String(limit),
-                    recommended: recommended ? "true" : "false"
-                });
-        
-                clearResults();
-                clearHomeMap(); // Clear map and previous highlight
+              }
+                            // Autocomplete wiring
+                            srcInput.addEventListener("input", () => {
+                                handleAutocompleteInput(srcInput, srcSuggestions);
+                            });
+                            dstInput.addEventListener("input", () => {
+                                handleAutocompleteInput(dstInput, dstSuggestions);
+                            });
+                
+                            srcInput.addEventListener("keydown", (e) => {
+                                handleAutocompleteKeydown(e, srcInput, srcSuggestions);
+                            });
+                            dstInput.addEventListener("keydown", (e) => {
+                                handleAutocompleteKeydown(e, dstInput, dstSuggestions);
+                            });
+                
+                            // Hide suggestions when clicking outside
+                            document.addEventListener("click", (e) => {
+                                if (!e.target.closest(".autocomplete-container")) {
+                                    srcSuggestions.style.display = "none";
+                                    dstSuggestions.style.display = "none";
+                                }
+                            });
+                            // Clear Filters button: reset airline + layover filters and re-render
+                            clearFiltersBtn.addEventListener("click", () => {
+                                activeAirlineFilter = null;
+                                activeLayoverFilter = null;
+                                clearRouteFocus(); 
+                                renderLastResults();
+                            });
+                    // ----- Network calls -----
+                
+                    form.addEventListener("submit", function (event) {
+                        
+                        event.preventDefault();
+                        setError("");
+                        
+                        // 🔄 Reset airline filter whenever a new search is run
+                          activeAirlineFilter = null;
+                          airlineFilters.innerHTML = ""; // optional, it'll be repopulated by render
+                
+                        activeLayoverFilter = null;
+                        layoverFilters.innerHTML = "";
+                        clearRouteFocus();
+                        
+                        errorEl.textContent = "";
+                          resultsList.innerHTML = '<p class="no-results">Loading...</p>';
 
-                resultsList.innerHTML = '<p class="no-results">Loading one-hop routes…</p>';
-        
-                fetch("/onehop?" + params.toString())
-                    .then(function (response) {
-                        if (!response.ok) {
-                            return response.text().then(function (text) {
-                                throw new Error("Server returned " + response.status + ": " + text);
-                            });
+                
+                        const pair = getSrcDstOrError();
+                        if (!pair) return;
+                        const src = pair.src;
+                        const dst = pair.dst;
+                
+                        let limit = parseInt((limitInput.value || "").trim(), 10);
+                        if (isNaN(limit) || limit <= 0) {
+                            limit = 20;
+                            limitInput.value = "20";
                         }
-                        return response.json();
-                    })
-                    .then(function (data) {
-                        if (data && typeof data === "object" && data.error) {
-                            setError("Server error: " + data.error);
-                            clearResults();
-                            return;
-                        }
-                         // New search → default to cards view
-                        viewMode = "cards";
-                        updateViewModeTabs();
-                        renderOneHopResults(data);
-                    })
-                    .catch(function (err) {
-                        console.error(err);
-                        setError("Request failed. Please try again.");
+                        const recommended = recommendedInput.checked;
+                
+                        const params = new URLSearchParams({
+                            src: src,
+                            dst: dst,
+                            limit: String(limit),
+                            recommended: recommended ? "true" : "false"
+                        });
+                
                         clearResults();
-                    });
-            });
-        
-            directButton.addEventListener("click", function () {
-                setError("");
-                const pair = getSrcDstOrError();
-                if (!pair) return;
-        
-                const params = new URLSearchParams({
-                    src: pair.src,
-                    dst: pair.dst
-                });
-        
-                clearResults();
-                clearHomeMap(); // Clear map and previous highlight
-                resultsList.innerHTML = '<p class="no-results">Loading non-stop routes…</p>';
-        
-                fetch("/direct?" + params.toString())
-                    .then(function (response) {
-                        if (!response.ok) {
-                            return response.text().then(function (text) {
-                                throw new Error("Server returned " + response.status + ": " + text);
+                        clearHomeMap(); // Clear map and previous highlight
+
+                        resultsList.innerHTML = '<p class="no-results">Loading one-hop routes…</p>';
+                
+                        fetch("/onehop?" + params.toString())
+                            .then(function (response) {
+                                if (!response.ok) {
+                                    return response.text().then(function (text) {
+                                        throw new Error("Server returned " + response.status + ": " + text);
+                                    });
+                                }
+                                return response.json();
+                            })
+                            .then(function (data) {
+                                if (data && typeof data === "object" && data.error) {
+                                    setError("Server error: " + data.error);
+                                    clearResults();
+                                    return;
+                                }
+                                 // New search → default to cards view
+                                viewMode = "cards";
+                                updateViewModeTabs();
+                                renderOneHopResults(data);
+                            })
+                            .catch(function (err) {
+                                console.error(err);
+                                setError("Request failed. Please try again.");
+                                clearResults();
                             });
-                        }
-                        return response.json();
-                    })
-                    .then(function (data) {
-                        if (data && typeof data === "object" && data.error) {
-                            setError("Server error: " + data.error);
-                            clearResults();
-                            return;
-                        }
-                        viewMode = "cards";
-                        updateViewModeTabs();
-        
-                        renderNonstopResults(data);
-                    })
-                    .catch(function (err) {
-                        console.error(err);
-                        setError("Request failed. Please try again.");
-                        clearResults();
                     });
-            });
-        
-        })();
-        </script>
-        </body>
-        </html>
+                
+                    directButton.addEventListener("click", function () {
+                        setError("");
+                        const pair = getSrcDstOrError();
+                        if (!pair) return;
+                
+                        const params = new URLSearchParams({
+                            src: pair.src,
+                            dst: pair.dst
+                        });
+                
+                        // 🔵 Non-stop search: reset layover filters immediately
+                            activeLayoverFilter = null;
+                            layoverFilters.innerHTML = "";
+                
+                        clearResults();
+                        clearHomeMap(); // Clear map and previous highlight
+                        resultsList.innerHTML = '<p class="no-results">Loading non-stop routes…</p>';
+                
+                        fetch("/direct?" + params.toString())
+                            .then(function (response) {
+                                if (!response.ok) {
+                                    return response.text().then(function (text) {
+                                        throw new Error("Server returned " + response.status + ": " + text);
+                                    });
+                                }
+                                return response.json();
+                            })
+                            .then(function (data) {
+                                if (data && typeof data === "object" && data.error) {
+                                    setError("Server error: " + data.error);
+                                    clearResults();
+                                    return;
+                                }
+                                viewMode = "cards";
+                                updateViewModeTabs();
+                
+                                renderNonstopResults(data);
+                            })
+                            .catch(function (err) {
+                                console.error(err);
+                                setError("Request failed. Please try again.");
+                                clearResults();
+                            });
+                    });
+                
+                })();
+                </script>
+                </body>
+                </html>
         )HTML";
             
             response = buildHttpResponse(body, "text/html; charset=UTF-8");
@@ -3184,6 +3546,27 @@ int main() {
               text-transform: uppercase;
               letter-spacing: 0.06em;
             }
+
+            /* NEW: keep long label + ⓘ on one line */
+            .field label {
+              display: inline-flex;
+              align-items: center;
+              gap: 0.35rem;
+            }
+
+            /* Slightly smaller text inside that label so it fits nicely */
+            .field .label-text {
+              font-size: 0.76rem;
+            }
+
+            /* Style the info icon itself */
+            .info-icon {
+              font-size: 0.9rem;
+              cursor: help;
+              line-height: 1;
+              user-select: none;
+            }
+
             input[type="text"],
             input[type="number"] {
               padding: 0.4rem 0.5rem;
@@ -3230,40 +3613,246 @@ int main() {
               flex-direction: column;
               gap: 0.75rem;
             }
-            .route-card {
-              background: #ffffff;
-              border-radius: 12px;
-              padding: 0.75rem 1rem;
-              box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-              font-size: 0.93rem;
-            }
-            .route-main-line {
-              display: flex;
-              align-items: center;
-              gap: 0.35rem;
-              font-weight: 600;
-              margin-bottom: 0.25rem;
-            }
-            .route-city {
-              font-size: 0.96rem;
-            }
-            .route-tag {
-              font-size: 0.72rem;
-              font-weight: 600;
-              padding: 0.1rem 0.55rem;
-              border-radius: 999px;
-              margin-left: 0.2rem;
-              white-space: nowrap;
-              background: #e8f0fe;
-              color: #174ea6;
-            }
-            .route-sub-line {
-              font-size: 0.83rem;
-              color: #4b5563;
-              display: flex;
-              flex-wrap: wrap;
-              gap: 0.4rem;
-            }
+
+                       .route-card {
+                         background: #ffffff;
+                         border-radius: 12px;
+                         padding: 0.75rem 1rem;
+                         box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+                         font-size: 0.93rem;
+                       }
+                       .route-main-line {
+                         display: flex;
+                         align-items: center;
+                         gap: 0.35rem;
+                         font-weight: 600;
+                         margin-bottom: 0.25rem;
+                       }
+                       .route-city {
+                         font-size: 0.96rem;
+                       }
+                       .route-tag {
+                         font-size: 0.72rem;
+                         font-weight: 600;
+                         padding: 0.1rem 0.55rem;
+                         border-radius: 999px;
+                         margin-left: 0.2rem;
+                         white-space: nowrap;
+                         background: #e8f0fe;
+                         color: #174ea6;
+                       }
+                       /* “ceased operations” chip – same palette vibe as codeshare */
+                       .route-tag.ceased {
+                         background: #fef7e0;
+                         color: #915b00;
+                       }
+                       .route-sub-line {
+                         font-size: 0.83rem;
+                         color: #4b5563;
+                         display: flex;
+                         flex-direction: column;
+                         gap: 0.25rem;
+                       }
+                       /* NEW: dedicated line just for the ceased-ops chip */
+                       .ceased-line {
+                         margin-top: 0.05rem;
+                       }
+                       /* NEW: row of colored meta chips (country, IATA, ICAO, totals) */
+                       .meta-chips-row {
+                         display: flex;
+                         flex-wrap: wrap;
+                         gap: 0.35rem;
+                       }
+                       .meta-chip {
+                         font-size: 0.75rem;
+                         font-weight: 500;
+                         padding: 0.12rem 0.6rem;
+                         border-radius: 999px;
+                         white-space: nowrap;
+                       }
+                       .meta-chip.country-chip {
+                         background: #e0f2fe;
+                         color: #075985;
+                       }
+                       .meta-chip.iata-chip {
+                         background: #ecfdf5;
+                         color: #166534;
+                       }
+                       .meta-chip.icao-chip {
+                         background: #fef3c7;
+                         color: #92400e;
+                       }
+                       .meta-chip.totals-chip {
+                         background: #e5e7eb;
+                         color: #374151;
+                       }
+                       /* right-side “Active = …” stack */
+                       .airline-summary-right {
+                         margin-left: auto;
+                         display: flex;
+                         flex-direction: column;
+                         align-items: flex-end;
+                         gap: 0.25rem;
+                       }
+                       .status-pill {
+                         display: inline-flex;
+                         align-items: center;
+                         padding: 0.15rem 0.7rem;
+                         border-radius: 999px;
+                         font-size: 0.78rem;
+                         font-weight: 500;
+                         white-space: nowrap;
+                         margin-top: 0.15rem;
+                       }
+                       .status-pill.active {
+                         background: #111827;
+                         color: #f9fafb;
+                       }
+                       .status-pill.inactive {
+                         background: #e5e7eb;
+                         color: #4b5563;
+                       }
+        /* --- Airport cards (clickable) --- */
+        .airport-card {
+          cursor: pointer;
+          transition: box-shadow 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
+        }
+
+        .airport-card:hover {
+          box-shadow: 0 4px 10px rgba(15, 23, 42, 0.12);
+          transform: translateY(-1px);
+          border-color: #93c5fd;
+        }
+
+        .airport-card.selected {
+          border-color: #2563eb;
+          box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.65);
+        }
+
+        /* Main line + subline inside airport cards */
+        .airport-main-line {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 0.75rem;
+        }
+
+        .airport-name {
+          font-weight: 600;
+          font-size: 0.95rem;
+        }
+
+        .airport-subline {
+          font-size: 0.82rem;
+          color: #4b5563;
+          margin-top: 0.1rem;
+        }
+        /* Expanded arrivals / departures section inside an airport card */
+        .airport-flows {
+          margin-top: 0.6rem;
+          padding-top: 0.65rem;
+          border-top: 1px solid #e5e7eb;
+        }
+
+        .flow-section {
+          margin-bottom: 0.75rem;
+        }
+
+        .flow-section-title {
+          font-size: 0.78rem;
+          font-weight: 600;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+          color: #6b7280;
+          margin-bottom: 0.35rem;
+        }
+
+        /* Airport details – table-like grid */
+        .airport-flow-section {
+          margin-top: 0.75rem;
+        }
+
+        .airport-flow-title {
+          font-size: 0.78rem;
+          font-weight: 600;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          color: #6b7280;
+          margin-bottom: 0.35rem;
+        }
+
+        /* One grid that automatically creates as many columns/rows as needed */
+        .flows-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+          column-gap: 1.75rem;
+          row-gap: 0.2rem;
+          font-size: 0.86rem;
+        }
+
+        /* Each destination cell */
+        .flow-item {
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        /* Expanded details inside an airport card */
+                .airport-details {
+                  display: none;              /* hidden until card is clicked */
+                  margin-top: 0.55rem;
+                  padding-top: 0.45rem;
+                  border-top: 1px solid #e5e7eb;
+                  font-size: 0.8rem;
+                  color: #4b5563;
+                }
+
+                .airport-flow-section {
+                  margin-bottom: 0.4rem;
+                }
+
+                .airport-flow-title {
+                  font-weight: 600;
+                  font-size: 0.78rem;
+                  text-transform: uppercase;
+                  letter-spacing: 0.04em;
+                  margin-bottom: 0.2rem;
+                  color: #6b7280;
+                }
+
+              
+                .airport-flow-airport {
+                  font-weight: 500;
+                }
+
+              
+                .airport-details-empty {
+                  font-style: italic;
+                  color: #9ca3af;
+                }
+
+        /* --- Direction (Arrivals/Departures) tabs --- */
+        .direction-tabs {
+          display: inline-flex;
+          gap: 0.25rem;
+          margin-top: 0.35rem;
+          margin-bottom: 0.45rem;
+          font-size: 0.78rem;
+        }
+
+        .direction-tab {
+          border: none;
+          cursor: pointer;
+          background: #e5e7eb;
+          color: #111827;
+          padding: 0.15rem 0.7rem;
+          border-radius: 999px;
+          font-weight: 500;
+        }
+
+        .direction-tab.active {
+          background: #1d4ed8;
+          color: #f9fafb;
+        }
             .no-results {
               font-size: 0.9rem;
               color: #6b7280;
@@ -3346,25 +3935,38 @@ int main() {
             </div>
         
             <form id="airline-form">
-              <div class="field-group">
-                <div class="field autocomplete-container" style="max-width: 220px;">
-                  <label for="airline">Airline code (IATA)</label>
-                  <input id="airline" name="airline" type="text" maxlength="40"
-                         placeholder="e.g. AA, DL, UA or 'American'" autocomplete="off" />
-                  <div id="airline-suggestions" class="autocomplete-list" style="display:none;"></div>
-                </div>
-                <div class="field" style="max-width: 120px;">
-                  <label for="limit">Max airports</label>
-                  <input id="limit" name="limit" type="number" min="1" value="50" />
-                </div>
-              </div>
-              <button type="submit" class="btn btn-primary">
-                Search Airline Routes
-              </button>
-              <div id="error"></div>
-              <div class="hint">
-                Uses the <code>/airline/routes?code=XX</code> API from the server.
-              </div>
+             <div class="field-group">
+               <!-- WIDER airline field -->
+               <div class="field autocomplete-container"
+                    style="max-width: 340px; flex: 2 1 0;">
+                 <label for="airline">
+                   <span class="label-text">Airline (IATA code or name)</span>
+                   <span class="info-icon"
+                         title="Type an IATA code like &quot;AA&quot; or part of an airline name like &quot;American&quot; to search.">
+                     ⓘ
+                   </span>
+                 </label>
+                 <input id="airline" name="airline" type="text" maxlength="40"
+                        placeholder="e.g. AA, DL, UA or 'American'" autocomplete="off" />
+                 <div id="airline-suggestions" class="autocomplete-list" style="display:none;"></div>
+               </div>
+
+               <!-- NARROWER max-airports field -->
+               <div class="field"
+                    style="max-width: 120px; flex: 0 0 120px;">
+                 <label for="limit">Max airports</label>
+                 <input id="limit" name="limit" type="number" min="1" value="50" />
+               </div>
+             </div>
+
+             <button type="submit" class="btn btn-primary">
+               Search Airline Routes
+             </button>
+             <div id="error"></div>
+             <div class="hint">
+               Uses the <code>/airline/routes?code=XX</code> API from the server.
+             </div>
+
             </form>
         
             <h3>Results</h3>
@@ -3374,7 +3976,14 @@ int main() {
               <button class="view-tab active" data-mode="cards">Cards</button>
               <button class="view-tab" data-mode="json">JSON</button>
             </div>
-        
+
+            <!-- NEW: Arrivals / Departures filter for map -->
+            <div class="direction-tabs" id="directionTabs">
+              <button class="direction-tab active" data-direction="all">All routes</button>
+              <button class="direction-tab" data-direction="arrivals">Arrivals</button>
+              <button class="direction-tab" data-direction="departures">Departures</button>
+            </div>
+
             <div id="resultsList" class="results-list">
               <p class="no-results">(no results yet)</p>
             </div>
@@ -3404,6 +4013,13 @@ int main() {
                             
                             // Map state to be used later
                             let routeMapIsLoaded = false; 
+                            // Keep the full airline GeoJSON so we can filter it later
+                            let lastGeoJsonData = null;
+
+                            // Current airport filter + direction filter for the map
+                            let selectedAirportCode = null;      // e.g. "DFW"
+                            let directionFilter = "all";         // "all" | "arrivals" | "departures"
+
 
                             map.on('load', () => {
                                 routeMapIsLoaded = true;
@@ -3416,11 +4032,41 @@ int main() {
               let viewMode = "cards";      // "cards" | "json"
               let lastData = null;         // last JSON from /airline/routes
               let lastTotalAirports = 0;   // <-- total airports before client-side limiting
-            const airlineSuggestions = document.getElementById("airline-suggestions");
-        
+              const directionTabs = document.getElementById("directionTabs");
+              const directionButtons = directionTabs.querySelectorAll(".direction-tab");
+            
+              // --- Direction filter: All / Arrivals / Departures ---
+              // Uses the existing `directionFilter` and `directionButtons`
+
+              function updateDirectionTabs() {
+                directionButtons.forEach(btn => {
+                  const dir = btn.getAttribute("data-direction");   // NOTE: matches your HTML
+                  if (dir === directionFilter) btn.classList.add("active");
+                  else btn.classList.remove("active");
+                });
+              }
+
+              // Initial state: "all" is already marked active in the HTML, but this keeps it in sync
+              updateDirectionTabs();
+
+              directionButtons.forEach(btn => {
+                btn.addEventListener("click", () => {
+                  const dir = btn.getAttribute("data-direction");
+                  if (!dir || dir === directionFilter) return;
+
+                  directionFilter = dir;
+                  updateDirectionTabs();
+
+                  // Re-apply the filter to whatever airport (if any) is currently selected
+                  applyAirportFilterForMap(selectedAirportCode);
+                });
+              });
+              const airlineSuggestions = document.getElementById("airline-suggestions");
+    
             // Cache of all airlines from /airlines
             let allAirlines = null;
             let activeSuggestionIndex = -1;
+            let selectedAirline = null; 
         
             // Load all airlines once (IATA non-empty, sorted by IATA)
             function loadAllAirlinesOnce() {
@@ -3453,6 +4099,8 @@ int main() {
             function renderAirlineSuggestions(list) {
               airlineSuggestions.innerHTML = "";
               activeSuggestionIndex = -1;
+              selectedAirline = null;   // ✅ user is typing again, clear previous selection
+
         
               if (!list.length) {
                 airlineSuggestions.innerHTML =
@@ -3473,6 +4121,7 @@ int main() {
                   airlineInput.value = label;
                   airlineSuggestions.style.display = "none";
                   airlineSuggestions.innerHTML = "";
+                  selectedAirline = a;   // ✅ remember exactly which airline they chose
                 });
         
                 airlineSuggestions.appendChild(div);
@@ -3556,6 +4205,7 @@ int main() {
                 airlineSuggestions.style.display = "none";
               }
             }
+            
             // --- Airline logo helpers ---
             function getAirlineLogoUrl(code) {
               if (!code || code === "\\N") {
@@ -3587,6 +4237,7 @@ int main() {
               return pill;
             }
         
+        
               function setError(msg) {
                 errorEl.textContent = msg || "";
               }
@@ -3594,6 +4245,16 @@ int main() {
               function clearResults() {
                 resultsList.innerHTML = "";
               }
+         // Optional: known “ceased operations” years for some airlines.
+                    // If an airline isn't in this table, we just show a generic message.
+                    function getAirlineCeasedYear(airline) {
+                      const byIata = {
+                        // United Airways (Bangladesh) – ceased 2016
+                        "4H": "2016",
+                      };
+                      const code = (airline.iata || airline.icao || airline.code || "").toUpperCase();
+                      return byIata[code] || null;
+                    }
         // Helper: Remove Existing Layer - NOW HARDENED
             function clearMapRoutes() {
                 if (!routeMapIsLoaded) return;
@@ -3673,82 +4334,375 @@ int main() {
                 });
               });
         
-              function renderCards(data) {
-                clearResults();
+        function applyAirportFilterForMap(airportCode) {
+          selectedAirportCode = airportCode || null;
+
+          if (!routeMapIsLoaded || !lastGeoJsonData || !lastGeoJsonData.features) {
+            return;
+          }
+
+          // If no airport is selected, show all routes
+          if (!selectedAirportCode) {
+            renderMapRoutes(lastGeoJsonData);
+            return;
+          }
+
+          const dir = directionFilter; // "all" | "arrivals" | "departures"
+
+          const filteredFeatures = lastGeoJsonData.features.filter(f => {
+            const props = f.properties || {};
+            const src = props.src_iata;
+            const dst = props.dst_iata;
+
+            if (dir === "arrivals") {
+              return dst === selectedAirportCode;
+            } else if (dir === "departures") {
+              return src === selectedAirportCode;
+            } else {
+              // all
+              return src === selectedAirportCode || dst === selectedAirportCode;
+            }
+          });
+
+          const filteredGeoJson = {
+            type: "FeatureCollection",
+            features: filteredFeatures
+          };
+
+          renderMapRoutes(filteredGeoJson);
+        }
+
         
-                if (!data || !data.airline) {
-                  resultsList.innerHTML =
-                    '<p class="no-results">No results to display yet.</p>';
-                  return;
+          // Build a quick lookup: airport code -> metadata (city, country etc.)
+                let airportMetaByCode = {};
+
+                function rebuildAirportMetaIndex(airportsArray) {
+                  airportMetaByCode = {};
+                  (airportsArray || []).forEach(entry => {
+                    const ap = entry.airport || {};
+                    const code = ap.iata || ap.icao;
+                    if (!code) return;
+                    airportMetaByCode[code] = ap;
+                  });
                 }
-        
-                const airline = data.airline;
-                const airports = data.airports || [];
-                const totalInDataset =
-                  (typeof lastTotalAirports === "number" && lastTotalAirports > 0)
-                    ? lastTotalAirports
-                    : airports.length;
-        
-                if (!airports.length) {
-                  resultsList.innerHTML =
-                    '<p class="no-results">This airline has no routes in the dataset.</p>';
-                  return;
+
+                // Given an airport code, compute arrivals and departures frequencies
+                function computeAirportFlows(airportCode, maxRows = Infinity) {
+                  const result = {
+                    arrivals: [],    // [{ other: "SFO", count: N }, ...]
+                    departures: []   // [{ other: "SFO", count: N }, ...]
+                  };
+
+                  if (
+                    !airportCode ||
+                    !lastGeoJsonData ||
+                    !Array.isArray(lastGeoJsonData.features)
+                  ) {
+                    return result;
+                  }
+
+                  const arrivalsMap = new Map();
+                  const departuresMap = new Map();
+
+                  lastGeoJsonData.features.forEach(f => {
+                    const props = f.properties || {};
+                    const src = props.src_iata;
+                    const dst = props.dst_iata;
+                    if (!src || !dst) return;
+
+                    // one row per route in the underlying dataset
+                    if (src === airportCode) {
+                      departuresMap.set(dst, (departuresMap.get(dst) || 0) + 1);
+                    }
+                    if (dst === airportCode) {
+                      arrivalsMap.set(src, (arrivalsMap.get(src) || 0) + 1);
+                    }
+                  });
+        function buildAirportFlowsDetail(airportCode, flows) {
+          const wrapper = document.createElement("div");
+          wrapper.className = "airport-flows";
+
+          function makeSection(title, list) {
+            if (!list || !list.length) return;
+
+            const section = document.createElement("div");
+            section.className = "flow-section";
+
+            const heading = document.createElement("div");
+            heading.className = "flow-section-title";
+            heading.textContent = title;
+            section.appendChild(heading);
+
+            const row = document.createElement("div");
+            row.className = "flows-row";
+
+            // 👉 12 codes per column
+            const columns = chunkArray(list, 12);
+            columns.forEach(colItems => {
+              const col = document.createElement("div");
+              col.className = "flows-col";
+
+              colItems.forEach(item => {
+                const div = document.createElement("div");
+                div.className = "flow-item";
+                // no "1 route" text, just the code
+                div.textContent = item.code || "???";
+                col.appendChild(div);
+              });
+
+              row.appendChild(col);
+            });
+
+            section.appendChild(row);
+            wrapper.appendChild(section);
+          }
+
+          makeSection("ARRIVALS (TO " + airportCode + ")", flows.arrivals);
+          makeSection("DEPARTURES (FROM " + airportCode + ")", flows.departures);
+
+          return wrapper;
+        }
+
+                  function mapToSortedArray(map) {
+                    return Array.from(map.entries())
+                      .sort((a, b) => b[1] - a[1])       // most frequent first
+                      .slice(0, maxRows)                 // cap to avoid huge lists
+                      .map(([other, count]) => ({ other, count }));
+                  }
+
+                  result.arrivals = mapToSortedArray(arrivalsMap);
+                  result.departures = mapToSortedArray(departuresMap);
+                  return result;
                 }
+
+               // Render arrivals/departures into the details element of a card using a flexible grid
+               function populateAirportDetails(airportCode, detailsEl) {
+                 if (!detailsEl) return;
+
+                 const { arrivals, departures } = computeAirportFlows(airportCode);
+
+                 if (!arrivals.length && !departures.length) {
+                   detailsEl.innerHTML =
+                     '<div class="airport-details-empty">No detailed routes in the dataset for this airport.</div>';
+                   return;
+                 }
+
+                 // Same helper as before: City (CODE) if we know the city
+                 function formatAirportLabel(code) {
+                   const meta = airportMetaByCode[code];
+                   if (!meta) return code;
+                   const city = meta.city || "";
+                   if (city) return city + " (" + code + ")";
+                   return code;
+                 }
+
+                 const parts = [];
+
+                 function renderSection(title, list) {
+                   if (!list || !list.length) return;
+
+                   parts.push('<div class="airport-flow-section">');
+                   parts.push('<div class="airport-flow-title">' + title + '</div>');
+                   parts.push('<div class="flows-grid">');
+
+                   list.forEach(({ other }) => {
+                     parts.push(
+                       '<div class="flow-item">' +
+                         formatAirportLabel(other) +
+                       '</div>'
+                     );
+                   });
+
+                   parts.push('</div>');  // .flows-grid
+                   parts.push('</div>');  // .airport-flow-section
+                 }
+
+                 renderSection('Arrivals (to ' + airportCode + ')', arrivals);
+                 renderSection('Departures (from ' + airportCode + ')', departures);
+
+                 detailsEl.innerHTML = parts.join('');
+               }
+
         
-                // Airline summary card at top, with logo pill
-                const summary = document.createElement("div");
-                summary.className = "route-card";
-        
-                const code = airline.iata || airline.icao || "";
-        
-                // build top line with a placeholder span we’ll replace with the pill
-                summary.innerHTML =
-                  '<div class="route-main-line">' +
-                    '<span class="__airline-pill-slot"></span>' +
-                  '</div>' +
-                  '<div class="route-sub-line">' +
-                    (airline.country ? '<span>Country: ' + airline.country + '</span>' : '') +
-                    '<span>Total airports in dataset: ' + totalInDataset + '</span>' +
-                  '</div>';
-        
-                // create pill and insert it
-                const pill = createAirlinePill({
-                  name: airline.name,
-                  iata: airline.iata,
-                  icao: airline.icao,
-                  code: code
-                });
-                summary.querySelector(".__airline-pill-slot").replaceWith(pill);
-        
-                resultsList.appendChild(summary);
-        
-                // One card per airport
-                airports.forEach(function (entry) {
-                  const ap = entry.airport || {};
-                  const count = entry.routes || 0;
-        
-                  const city = ap.city || "";
-                  const country = ap.country || "";
-                  const iata = ap.iata || ap.icao || "???";
-        
-                  const card = document.createElement("div");
-                  card.className = "route-card";
-                  card.innerHTML =
-                    '<div class="route-main-line">' +
-                      '<span class="route-city">' +
-                        (city ? city : "Unknown city") +
-                        ' (' + iata + ')' +
-                      '</span>' +
-                      '<span class="route-tag">' + count + ' route' +
-                        (count === 1 ? '' : 's') + '</span>' +
-                    '</div>' +
-                    '<div class="route-sub-line">' +
-                      (country ? '<span>' + country + '</span>' : '') +
-                    '</div>';
-        
-                  resultsList.appendChild(card);
-                });
-              }
+                                         function renderCards(data) {
+                                           clearResults();
+
+                                           if (!data || !data.airline) {
+                                             resultsList.innerHTML =
+                                               '<p class="no-results">No results to display yet.</p>';
+                                             return;
+                                           }
+
+                                           const airline = data.airline;
+                                           const airports = data.airports || [];
+                                        // Rebuild airport metadata index so flows can show city/country
+                                        rebuildAirportMetaIndex(airports);
+
+                                           // Total airports (before limiting) from last fetch
+                                           const totalInDataset =
+                                             (typeof lastTotalAirports === "number" && lastTotalAirports > 0)
+                                               ? lastTotalAirports
+                                               : airports.length;
+
+                                           // Sum of routes across all airports
+                                           const totalRoutes = airports.reduce((sum, entry) => {
+                                             const c = entry && typeof entry.routes === "number" ? entry.routes : 0;
+                                             return sum + c;
+                                           }, 0);
+
+                                           // --- Airline summary card at top ---
+                                           const summary = document.createElement("div");
+                                           summary.className = "route-card";
+
+                                           const code = airline.iata || airline.icao || "";
+
+                                           summary.innerHTML =
+                                             '<div class="route-main-line">' +
+                                               '<span class="__airline-pill-slot"></span>' +
+                                               '<div class="airline-summary-right">' +
+                                                 '<span class="status-pill __status-pill-slot">Active = True</span>' +
+                                               '</div>' +
+                                             '</div>' +
+                                             // NEW: separate line just for the ceased-operations chip
+                                             '<div class="route-sub-line">' +
+                                               '<div class="ceased-line"></div>' +
+                                               '<div class="meta-chips-row">' +
+                                                 (airline.country
+                                                   ? '<span class="meta-chip country-chip">Country: ' + airline.country + '</span>'
+                                                   : '') +
+                                                 (airline.iata
+                                                   ? '<span class="meta-chip iata-chip">IATA: ' + airline.iata + '</span>'
+                                                   : '') +
+                                                 (airline.icao
+                                                   ? '<span class="meta-chip icao-chip">ICAO: ' + airline.icao + '</span>'
+                                                   : '') +
+                                                 '<span class="meta-chip totals-chip">Airports: ' + totalInDataset + '</span>' +
+                                                 '<span class="meta-chip totals-chip">Routes: ' + totalRoutes + '</span>' +
+                                               '</div>' +
+                                             '</div>';
+
+                                           // Insert shaded logo pill
+                                           const pill = createAirlinePill({
+                                             name: airline.name,
+                                             iata: airline.iata,
+                                             icao: airline.icao,
+                                             code: code
+                                           });
+                                           summary.querySelector(".__airline-pill-slot").replaceWith(pill);
+
+                                           // Wire up Active = True/False status chip
+                                           const statusEl = summary.querySelector(".__status-pill-slot");
+                                           if (statusEl) {
+                                             const isActive = !!airline.active;
+                                             const statusText = isActive ? "Active = True" : "Active = False";
+                                             statusEl.textContent = statusText;
+                                             statusEl.className = "status-pill " + (isActive ? "active" : "inactive");
+
+                                             // If inactive, show a “ceased operations” chip on its own line
+                                             if (!isActive) {
+                                               const ceasedYear = getAirlineCeasedYear(airline);
+                                               const ceasedMsg = ceasedYear
+                                                 ? ("This airline ceased operations in " + ceasedYear)
+                                                 : "This airline has ceased operations";
+
+                                               const ceasedTag = document.createElement("span");
+                                               ceasedTag.className = "route-tag ceased";
+                                               ceasedTag.textContent = ceasedMsg;
+
+                                               const ceasedLine = summary.querySelector(".ceased-line");
+                                               if (ceasedLine) {
+                                                 ceasedLine.appendChild(ceasedTag);
+                                               }
+                                             }
+                                           }
+
+                                           resultsList.appendChild(summary);
+
+                                           // If no airports, show the friendly message and stop
+                                           if (!airports.length) {
+                                             const msg = document.createElement("p");
+                                             msg.className = "no-results";
+                                             msg.textContent = "This airline has no routes in the dataset.";
+                                             resultsList.appendChild(msg);
+                                             return;
+                                           }
+
+                                           airports.forEach(function (entry) {
+                                             const ap = entry.airport || {};
+                                             const count = entry.routes || 0;
+
+                                             const city = ap.city || "";
+                                             const country = ap.country || "";
+                                             const iata = ap.iata || ap.icao || "???";
+
+                                             const card = document.createElement("div");
+                                             card.className = "route-card airport-card";
+                                             card.dataset.airportCode = iata;
+
+                                             card.innerHTML =
+                                                '<div class="airport-main-line">' +
+                                                '<div>' +
+                                                '<div class="airport-name">' +
+                                                  (city ? city : "Unknown city") +
+                                                  ' (' + iata + ')' +
+                                                '</div>' +
+                                                (country
+                                                  ? '<div class="airport-subline">' + country + '</div>'
+                                                  : '') +
+                                              '</div>' +
+                                              '<span class="route-tag">' + count + ' route' +
+                                                (count === 1 ? '' : 's') + '</span>' +
+                                            '</div>' +
+                                            '<div class="airport-details"></div>';
+
+                                          card.addEventListener("click", () => {
+                                            const alreadySelected = card.classList.contains("selected");
+
+                                            // Collapse any other selected/expanded airport
+                                            document
+                                              .querySelectorAll(".airport-card.selected")
+                                              .forEach(el => {
+                                                el.classList.remove("selected");
+                                                const d = el.querySelector(".airport-details");
+                                                if (d) {
+                                                  d.innerHTML = "";
+                                                  d.style.display = "none";
+                                                }
+                                              });
+
+                                            if (alreadySelected) {
+                                              // Turn this one off + reset map to all routes
+                                              card.classList.remove("selected");
+                                              selectedAirportCode = null;
+                                              applyAirportFilterForMap(null);   // will call renderMapRoutes(lastGeoJsonData)
+                                              return;
+                                            }
+
+                                            // Select this card
+                                            card.classList.add("selected");
+                                            selectedAirportCode = iata;
+                                            applyAirportFilterForMap(iata);
+
+                                            // Ensure we have a details container
+                                            let detailsEl = card.querySelector(".airport-details");
+                                            if (!detailsEl) {
+                                              detailsEl = document.createElement("div");
+                                              detailsEl.className = "airport-details";
+                                              card.appendChild(detailsEl);
+                                            }
+
+                                            // Fill it with the nice multi-column flows layout
+                                            populateAirportDetails(iata, detailsEl);
+                                            detailsEl.style.display = "block";
+                                          });
+
+                                          resultsList.appendChild(card);
+
+                                           });
+
+                                         }
+
+
         
               function renderJson() {
                 clearResults();
@@ -3793,16 +4747,31 @@ int main() {
                   setError("Please enter an airline (e.g. AA, DL, UA or 'American').");
                   return;
                 }
-        
-                // If the user picked "American Airlines (AA)", extract AA from parentheses
-                let m = raw.match(/\(([A-Z0-9]{2,3})\)\s*$/i);
-                let code;
-                if (m) {
-                  code = m[1].toUpperCase();
-                } else {
-                  // Fallback: treat first token as code
-                  const parts = raw.toUpperCase().split(/\s+/);
-                  code = parts[0];
+
+                // ✅ Prefer the ICAO of the airline actually chosen from the dropdown
+                let code = null;
+                if (selectedAirline) {
+                  const labelFromSelected = airlineDisplayLabel(selectedAirline);
+                  if (raw === labelFromSelected) {
+                    // If the airline has an ICAO (3-letter, unique), use that first
+                    if (selectedAirline.icao && selectedAirline.icao.length === 3) {
+                      code = selectedAirline.icao.toUpperCase();
+                    } else if (selectedAirline.iata) {
+                      code = selectedAirline.iata.toUpperCase();
+                    }
+                  }
+                }
+
+                // Fallback: parse from text if we didn't get a code from selectedAirline
+                if (!code) {
+                  // If the user picked "American Airlines (AA)", extract AA from parentheses
+                  const m = raw.match(/\(([A-Z0-9]{2,3})\)\s*$/i);
+                  if (m) {
+                    code = m[1].toUpperCase();
+                  } else {
+                    const parts = raw.toUpperCase().split(/\s+/);
+                    code = parts[0];
+                  }
                 }
         
                 let limit = parseInt((limitInput.value || "").trim(), 10);
@@ -3837,35 +4806,47 @@ int main() {
                                     });
 
                                 // 3. Process both in parallel
-                                Promise.all([cardDataPromise, geoJsonPromise])
-                                    .then(([cardData, geoJsonData]) => {
-                                        if (cardData && typeof cardData === "object" && cardData.error) {
-                                            setError("Server error: " + cardData.error);
-                                            clearResults();
-                                            return;
-                                        }
+                               Promise.all([cardDataPromise, geoJsonPromise])
+                                 .then(([cardData, geoJsonData]) => {
+                                   if (cardData && typeof cardData === "object" && cardData.error) {
+                                     setError("Server error: " + cardData.error);
+                                     clearResults();
+                                     return;
+                                   }
 
-                                        // A. Render the map first
-                                        renderMapRoutes(geoJsonData);
-                                        
-                                        // B. Render the cards (existing logic)
-                                        const airlinesArr = Array.isArray(cardData.airports) ? cardData.airports : [];
-                                        lastTotalAirports = airlinesArr.length;
-                                        let limitedAirports = airlinesArr;
-                                        if (airlinesArr.length > limit) {
-                                          limitedAirports = airlinesArr.slice(0, limit);
-                                        }
-                                        lastData = Object.assign({}, cardData, { airports: limitedAirports });
-                                        
-                                        viewMode = "cards";
-                                        updateViewTabs();
-                                        renderCards(lastData);
-                                    })
-                                    .catch(err => {
-                                        console.error(err);
-                                        setError("Request failed. Please check the console.");
-                                        clearResults();
-                                    });
+                                   // A. Remember the full GeoJSON so we can filter by airport later
+                                   lastGeoJsonData =
+                                     geoJsonData && typeof geoJsonData === "object"
+                                       ? geoJsonData
+                                       : { type: "FeatureCollection", features: [] };
+
+                                   // Reset any previous airport selection
+                                   selectedAirportCode = null;
+
+                                   // B. Draw all routes initially
+                                   renderMapRoutes(lastGeoJsonData);
+
+                                   // C. Render the cards (with our updated summary + airport cards)
+                                   const airportsArr = Array.isArray(cardData.airports) ? cardData.airports : [];
+                                   lastTotalAirports = airportsArr.length;
+
+                                   let limitedAirports = airportsArr;
+                                   if (airportsArr.length > limit) {
+                                     limitedAirports = airportsArr.slice(0, limit);
+                                   }
+
+                                   lastData = Object.assign({}, cardData, { airports: limitedAirports });
+
+                                   viewMode = "cards";
+                                   updateViewTabs();
+                                   renderCards(lastData);
+                                 })
+                                 .catch(err => {
+                                   console.error(err);
+                                   setError("Request failed. Please check the console.");
+                                   clearResults();
+                                 });
+                                    
                             });
             })();
           </script>
@@ -3878,577 +4859,2209 @@ int main() {
             response = buildHttpResponse(body, "text/html; charset=UTF-8");
         }
         
-        else if (pathOnly == "/airport-ui" || pathOnly == "/airport-ui/") {
+        else if (pathOnly == "/about-ui" || pathOnly == "/about-ui/") {
             std::string body = R"HTML(
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-              <meta charset="UTF-8" />
-              <title>Airport Airlines Explorer</title>
-              <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet" />
-              <style>
-                body {
-                  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                  margin: 0;
-                  padding: 1.5rem;
-                  background: #f5f5f5;
-                  color: #222;
-                }
-                .container {
-                  max-width: 880px;
-                  margin: 0 auto;
-                  background: #ffffff;
-                  border-radius: 12px;
-                  padding: 1.5rem 1.75rem 1.75rem;
-                  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-                }
-                .header-bar {
-                  display: flex;
-                  justify-content: space-between;
-                  align-items: center;
-                  gap: 1rem;
-                  margin-bottom: 0.75rem;
-                }
-                .header-left h1 {
-                  margin: 0;
-                  font-size: 1.7rem;
-                }
-                .subtitle {
-                  font-size: 0.85rem;
-                  color: #6b7280;
-                  margin-top: 0.15rem;
-                }
-                .header-right a {
-                  font-size: 0.8rem;
-                  text-decoration: none;
-                  padding: 0.35rem 0.65rem;
-                  border-radius: 999px;
-                  border: 1px solid #e5e7eb;
-                  color: #374151;
-                  background: #f9fafb;
-                }
-                .header-right a:hover {
-                  background: #e5e7eb;
-                }
-                form {
-                  display: grid;
-                  gap: 0.75rem;
-                  margin-bottom: 1rem;
-                }
-                .field-group {
-                  display: flex;
-                  flex-wrap: wrap;
-                  gap: 0.75rem;
-                }
-                .field {
-                  display: flex;
-                  flex-direction: column;
-                  min-width: 140px;
-                  flex: 1 1 0;
-                }
-                label {
-                  font-size: 0.8rem;
-                  font-weight: 600;
-                  margin-bottom: 0.25rem;
-                  text-transform: uppercase;
-                  letter-spacing: 0.06em;
-                }
-                input[type="text"],
-                input[type="number"] {
-                  padding: 0.4rem 0.5rem;
-                  border-radius: 6px;
-                  border: 1px solid #d1d5db;
-                  font-size: 0.95rem;
-                }
-                .btn {
-                  padding: 0.45rem 0.9rem;
-                  border-radius: 999px;
-                  border: none;
-                  font-size: 0.95rem;
-                  font-weight: 600;
-                  cursor: pointer;
-                  display: inline-flex;
-                  align-items: center;
-                  gap: 0.25rem;
-                }
-                .btn-primary {
-                  background: #2563eb;
-                  color: #ffffff;
-                }
-                .btn-primary:hover {
-                  background: #1d4ed8;
-                }
-                #error {
-                  margin-top: 0.25rem;
-                  color: #b91c1c;
-                  font-size: 0.9rem;
-                }
-                .hint {
-                  font-size: 0.85rem;
-                  color: #6b7280;
-                  margin-top: 0.25rem;
-                }
-                h3 {
-                  margin-top: 1.25rem;
-                  margin-bottom: 0.5rem;
-                  font-size: 1.05rem;
-                }
-                .results-list {
-                  margin-top: 0.5rem;
-                  display: flex;
-                  flex-direction: column;
-                  gap: 0.75rem;
-                }
-                .card {
-                  background: #ffffff;
-                  border-radius: 12px;
-                  padding: 0.75rem 1rem;
-                  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
-                  font-size: 0.93rem;
-                }
-                .main-line {
-                  display: flex;
-                  align-items: center;
-                  gap: 0.4rem;
-                  font-weight: 600;
-                  margin-bottom: 0.25rem;
-                }
-                .name-text {
-                  font-size: 0.96rem;
-                }
-                .pill {
-                  font-size: 0.72rem;
-                  font-weight: 600;
-                  padding: 0.1rem 0.55rem;
-                  border-radius: 999px;
-                  margin-left: 0.2rem;
-                  white-space: nowrap;
-                  background: #e8f0fe;
-                  color: #174ea6;
-                }
-                .sub-line {
-                  font-size: 0.83rem;
-                  color: #4b5563;
-                  display: flex;
-                  flex-wrap: wrap;
-                  gap: 0.4rem;
-                }
-                .no-results {
-                  font-size: 0.9rem;
-                  color: #6b7280;
-                }
-            
-                .view-mode-tabs {
-                  display: inline-flex;
-                  gap: 0.25rem;
-                  margin-top: 0.25rem;
-                  margin-bottom: 0.4rem;
-                  font-size: 0.8rem;
-                }
-                .view-tab {
-                  border: none;
-                  cursor: pointer;
-                  background: #e5e7eb;
-                  color: #111827;
-                  padding: 0.15rem 0.7rem;
-                  border-radius: 999px;
-                  font-weight: 500;
-                }
-                .view-tab.active {
-                  background: #111827;
-                  color: #f9fafb;
-                }
-            
-            /* Shaded airline pill (same as airline-ui) */
-            .airline-pill {
-              display: inline-flex;
-              align-items: center;
-              background: #f1f5f9;  /* light gray */
-              color: #1e293b;       /* dark slate */
-              padding: 0.15rem 0.6rem 0.15rem 0.25rem;
-              border-radius: 999px;
-              font-size: 0.78rem;
-              font-weight: 500;
-              margin-right: 0.4rem;
-              white-space: nowrap;
-              line-height: 1;
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                  <meta charset="UTF-8" />
+                  <title>About This OpenFlights Project</title>
+                  <meta name="viewport" content="width=device-width, initial-scale=1" />
+                  <style>
+                    body {
+                      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                      margin: 0;
+                      padding: 1.5rem;
+                      background: #f5f5f5;
+                      color: #222;
+                    }
+                    .container {
+                      max-width: 880px;
+                      margin: 0 auto;
+                      background: #ffffff;
+                      border-radius: 12px;
+                      padding: 1.5rem 1.75rem 1.75rem;
+                      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+                    }
+                    .header-bar {
+                      display: flex;
+                      justify-content: space-between;
+                      align-items: center;
+                      gap: 1rem;
+                      margin-bottom: 0.75rem;
+                    }
+                    .header-left h1 {
+                      margin: 0;
+                      font-size: 1.7rem;
+                    }
+                    .subtitle {
+                      font-size: 0.85rem;
+                      color: #6b7280;
+                      margin-top: 0.15rem;
+                    }
+                    .header-right {
+                      display: flex;
+                      flex-wrap: wrap;
+                      gap: 0.4rem;
+                      justify-content: flex-end;
+                    }
+                    .header-right a {
+                      font-size: 0.8rem;
+                      text-decoration: none;
+                      padding: 0.35rem 0.65rem;
+                      border-radius: 999px;
+                      border: 1px solid #e5e7eb;
+                      color: #374151;
+                      background: #f9fafb;
+                      white-space: nowrap;
+                    }
+                    .header-right a:hover {
+                      background: #e5e7eb;
+                    }
+
+                    /* Cards & layout, matching other pages */
+                    .cards-grid {
+                      display: flex;
+                      flex-direction: column;
+                      gap: 0.75rem;
+                      margin-top: 0.75rem;
+                    }
+                    .card {
+                      background: #ffffff;
+                      border-radius: 12px;
+                      padding: 0.9rem 1rem;
+                      box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+                      border: 1px solid #e5e7eb;
+                      font-size: 0.93rem;
+                    }
+                    .card-header {
+                      display: flex;
+                      justify-content: space-between;
+                      align-items: center;
+                      margin-bottom: 0.35rem;
+                    }
+                    .card-title {
+                      font-size: 0.95rem;
+                      font-weight: 600;
+                      color: #111827;
+                    }
+                    .card-body {
+                      font-size: 0.85rem;
+                      color: #374151;
+                    }
+                    .section-label {
+                      font-size: 0.8rem;
+                      font-weight: 600;
+                      text-transform: uppercase;
+                      letter-spacing: 0.06em;
+                      color: #9ca3af;
+                      margin-bottom: 0.35rem;
+                    }
+                    .card-body p {
+                      margin: 0 0 0.45rem 0;
+                    }
+                    .card-body ul {
+                      margin: 0.15rem 0 0.45rem 1.1rem;
+                      padding: 0;
+                      font-size: 0.85rem;
+                    }
+                    .card-body li {
+                      margin-bottom: 0.15rem;
+                    }
+
+                    .pill {
+                      font-size: 0.72rem;
+                      font-weight: 600;
+                      padding: 0.1rem 0.55rem;
+                      border-radius: 999px;
+                      white-space: nowrap;
+                      background: #e8f0fe;
+                      color: #174ea6;
+                    }
+
+                    .btn {
+                      padding: 0.45rem 0.9rem;
+                      border-radius: 999px;
+                      border: none;
+                      font-size: 0.95rem;
+                      font-weight: 600;
+                      cursor: pointer;
+                      display: inline-flex;
+                      align-items: center;
+                      gap: 0.25rem;
+                    }
+                    .btn-primary {
+                      background: #2563eb;
+                      color: #ffffff;
+                    }
+                    .btn-primary:hover {
+                      background: #1d4ed8;
+                    }
+
+                    .meta-row {
+                      font-size: 0.8rem;
+                      color: #6b7280;
+                      margin-top: 0.25rem;
+                    }
+                  </style>
+                </head>
+                <body>
+                  <div class="container">
+                    <div class="header-bar">
+                      <div class="header-left">
+                        <h1>About This OpenFlights Project</h1>
+                        <p class="subtitle">
+                          Capstone-style C++ project: custom HTTP server, OpenFlights data, and interactive route explorers.
+                        </p>
+                      </div>
+                      <div class="header-right">
+                        <a href="/">← Back to Route Finder</a>
+                        <a href="/airline-ui">Airline Routes</a>
+                        <a href="/airport-ui">Airport Airlines</a>
+                        <a href="/update-ui">Update Data</a>
+                      </div>
+                    </div>
+
+                    <div class="cards-grid">
+
+                      <!-- Project Summary -->
+                      <div class="card">
+                        <div class="card-header">
+                          <span class="card-title">Project Summary</span>
+                          <span class="pill">OpenFlights Explorer</span>
+                        </div>
+                        <div class="card-body">
+                          <p>
+                            This project is an OpenFlights-based airline and airport route explorer built on top of a
+                            hand-rolled C++ HTTP server. It exposes both JSON APIs and interactive HTML pages that let you
+                            explore the global route network from multiple angles.
+                          </p>
+                          <p class="section-label">Data sources</p>
+                          <ul>
+                            <li><code>airports.dat</code> &mdash; airport metadata (codes, names, cities, countries, coordinates).</li>
+                            <li><code>airlines.dat</code> &mdash; airline metadata (IATA/ICAO codes, names, countries, active flag).</li>
+                            <li><code>routes.dat</code> &mdash; individual routes linking airlines with source and destination airports.</li>
+                          </ul>
+                          <p class="section-label">High-level features</p>
+                          <ul>
+                            <li><strong>Airport-centric route discovery</strong> via <code>/airport-ui</code> &mdash; start from an airport and see who flies there.</li>
+                            <li><strong>Airline-centric route discovery</strong> via <code>/airline-ui</code> &mdash; start from an airline and see all the airports it serves.</li>
+                            <li><strong>Route Finder home page</strong> (<code>/</code>) for source/destination route search with rich filtering.</li>
+                            <li><strong>Mapbox-powered route visualization</strong> so matching routes are drawn directly on an interactive map.</li>
+                            <li><strong>Cards / JSON toggle mode</strong> that lets you switch between human-readable cards and raw JSON.</li>
+                            <li><strong>Clickable cards with detailed expansions</strong> for airports, airlines, and routes.</li>
+                            <li><strong>Fast route filtering</strong> using in-memory indexes instead of scanning the entire dataset on each request.</li>
+                          </ul>
+                        </div>
+                      </div>
+
+                      <!-- Technical Features -->
+                      <div class="card">
+                        <div class="card-header">
+                          <span class="card-title">Technical Architecture & Features</span>
+                          <span class="pill">C++17 • HTTP • GeoJSON</span>
+                        </div>
+                        <div class="card-body">
+                          <p>
+                            The backend is implemented as a custom C++17 HTTP server (no external web frameworks). It listens on a TCP
+                            socket, parses incoming HTTP requests, routes them by path, and returns either JSON or fully rendered HTML.
+                          </p>
+                          <p class="section-label">Backend internals</p>
+                          <ul>
+                            <li><strong>Custom HTTP server:</strong> request line parsing, header parsing, and simple routing using <code>pathOnly</code> checks.</li>
+                            <li><strong>In-memory indexes</strong> over OpenFlights data, including structures such as:
+                              <ul>
+                                <li><code>g_routesByAirlineId</code> &mdash; all routes for a given airline.</li>
+                                <li><code>g_routesBySrcAirport</code> &mdash; routes grouped by source airport.</li>
+                                <li><code>g_routesByDstAirport</code> &mdash; routes grouped by destination airport.</li>
+                              </ul>
+                            </li>
+                            <li><strong>Efficient lookups:</strong> user requests are answered by querying these maps instead of re-reading the files.</li>
+                            <li><strong>GeoJSON generation:</strong> endpoints produce GeoJSON FeatureCollections for routes, which the frontend uses to draw lines on the map.</li>
+                          </ul>
+
+                          <p class="section-label">Frontend behavior</p>
+                          <ul>
+                            <li><strong>Vanilla JavaScript</strong> for all client-side behavior (no frontend frameworks).</li>
+                            <li><strong>Mapbox GL JS integration</strong> to render route lines, highlight selected routes, and synchronize card interactions with the map.</li>
+                            <li><strong>Card-based UI</strong> built with reusable styles such as <code>.card</code>, <code>.card-header</code>, and <code>.card-body</code>.</li>
+                            <li><strong>JSON mode</strong> that reuses the same data but renders it inside a scrollable, syntax-like mono-spaced block.</li>
+                          </ul>
+                          <p class="meta-row">
+                            The goal is to keep the codebase small, readable, and focused on data structures, algorithms, and HTTP fundamentals.
+                          </p>
+                        </div>
+                      </div>
+
+                      <!-- Collaboration with AI -->
+                      <div class="card">
+                        <div class="card-header">
+                          <span class="card-title">Collaboration with AI (Pair Programming)</span>
+                          <span class="pill">Human + ChatGPT</span>
+                        </div>
+                        <div class="card-body">
+                          <p>
+                            This project was developed with AI (ChatGPT) acting as a pair programmer and design collaborator. The AI
+                            assisted with brainstorming, drafting code, and refining UI layouts, while the human developer wrote,
+                            integrated, and tested the final implementation in C++ and JavaScript.
+                          </p>
+                          <p class="section-label">How AI helped</p>
+                          <ul>
+                            <li><strong>UI layout & cards:</strong> iterating on the overall look and feel, including headers, cards, chips, and JSON panels.</li>
+                            <li><strong>Mapbox integration:</strong> wiring Mapbox GL JS into the pages, defining GeoJSON layers, and syncing card clicks with map highlights.</li>
+                            <li><strong>Interactive features:</strong> designing expandable cards, “Cards vs JSON” toggle modes, autocomplete fields, and status chips.</li>
+                            <li><strong>Server endpoints & helpers:</strong> suggesting helper APIs (e.g., GeoJSON endpoints) and data structures that fit the existing C++ design.</li>
+                            <li><strong>Debugging & refactoring:</strong> helping reason about edge cases, clarify error handling, and improve prompt wording when iterating on features.</li>
+                          </ul>
+                          <p class="section-label">Human responsibilities</p>
+                          <ul>
+                            <li>Owning the repository, build, and toolchain setup (Xcode, Docker, Fly.io, etc.).</li>
+                            <li>Deciding on the overall architecture and data structures for indexes and GeoJSON generation.</li>
+                            <li>Reviewing AI-generated suggestions, integrating them into the actual codebase, and adapting them to course requirements.</li>
+                            <li>Testing the server with real OpenFlights data and adjusting features based on performance and usability.</li>
+                          </ul>
+                          <p class="meta-row">
+                            The result is a capstone-style project that blends traditional data structures and systems programming
+                            with modern AI-assisted development and frontend mapping tools.
+                          </p>
+                        </div>
+                      </div>
+
+                      <!-- How to explore the UI -->
+                      <div class="card">
+                        <div class="card-header">
+                          <span class="card-title">How to Explore This Interface</span>
+                        </div>
+                        <div class="card-body">
+                          <ul>
+                            <li><strong>Route Finder (<code>/</code>)</strong> &mdash; search for routes between two airports, filter, and visualize paths on the map.</li>
+                            <li><strong>Airline Routes Explorer (<code>/airline-ui</code>)</strong> &mdash; start from an airline and explore all of its airports and routes.</li>
+                            <li><strong>Airport Airlines Explorer (<code>/airport-ui</code>)</strong> &mdash; start from an airport and see which airlines operate there.</li>
+                            <li><strong>Update UI (<code>/update-ui</code>)</strong> &mdash; experiment with inserting, modifying, or removing airports, airlines, and routes.</li>
+                            <li><strong>About UI (<code>/about-ui</code>)</strong> &mdash; this page, documenting the project, technical choices, and collaboration with AI.</li>
+                          </ul>
+                        </div>
+                      </div>
+
+                    </div>
+                  </div>
+                </body>
+                </html>
+            )HTML";
+
+            response = buildHttpResponse(body, "text/html; charset=UTF-8");
+        }
+        else if (pathOnly == "/update-ui" || pathOnly == "/update-ui/") {
+            std::string body = R"HTML(
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8" />
+          <title>Update OpenFlights Data</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <style>
+            body {
+              font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+              margin: 0;
+              padding: 1.5rem;
+              background: #f5f5f5;
+              color: #222;
             }
-            
-            .airline-pill img {
-              height: 1.25rem;
-              width: 1.25rem;
-              border-radius: 50%;
-              object-fit: contain;
-              margin-right: 0.35rem;
-              background: #ffffff;
-              border: 1px solid #e2e8f0;
-              flex-shrink: 0;
-            }
-            
-            
-            .airline-pill-fallback {
-              width: 22px;
-              height: 22px;
-              border-radius: 999px;
-              display: inline-flex;
-              align-items: center;
-              justify-content: center;
-              font-size: 0.8rem;
-              font-weight: 600;
-              background: #4f46e5;
-              color: #f9fafb;
-            }
-            
-            .airline-pill-name {
-              white-space: nowrap;
-            }
-            /* Per-airline rows under the airport summary */
-            .route-card {
+            .container {
+              max-width: 880px;
+              margin: 0 auto;
               background: #ffffff;
               border-radius: 12px;
-              padding: 0.55rem 0.85rem;
-              box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
-              border: 1px solid #e5e7eb;
-              display: flex;
-              flex-direction: column;
-              gap: 0.15rem;
-              font-size: 0.9rem;
+              padding: 1.5rem 1.75rem 1.75rem;
+              box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
             }
-            
-            .route-main-line {
+            .header-bar {
               display: flex;
-              align-items: center;
               justify-content: space-between;
+              align-items: center;
+              gap: 1rem;
+              margin-bottom: 0.75rem;
+            }
+            .header-left h1 {
+              margin: 0;
+              font-size: 1.7rem;
+            }
+            .subtitle {
+              font-size: 0.85rem;
+              color: #6b7280;
+              margin-top: 0.15rem;
+            }
+            .header-right a {
+              font-size: 0.8rem;
+              text-decoration: none;
+              padding: 0.35rem 0.65rem;
+              border-radius: 999px;
+              border: 1px solid #e5e7eb;
+              color: #374151;
+              background: #f9fafb;
+            }
+            .header-right a:hover {
+              background: #e5e7eb;
+            }
+
+            form {
+              display: grid;
+              gap: 0.75rem;
+              margin-bottom: 1.25rem;
+            }
+            .field-group {
+              display: flex;
+              flex-wrap: wrap;
               gap: 0.75rem;
             }
-            
-            .route-tag {
-              font-size: 0.78rem;
+            .field {
+              display: flex;
+              flex-direction: column;
+              min-width: 140px;
+              flex: 1 1 0;
+            }
+            .field label {
+              font-size: 0.8rem;
               font-weight: 600;
-              padding: 0.1rem 0.55rem;
+              margin-bottom: 0.15rem;
+              color: #374151;
+            }
+            .field input,
+            .field select,
+            .field textarea {
+              border-radius: 8px;
+              border: 1px solid #d1d5db;
+              padding: 0.45rem 0.55rem;
+              font-size: 0.9rem;
+            }
+
+            .btn {
               border-radius: 999px;
-              background: #111827;
+              padding: 0.45rem 1.1rem;
+              font-size: 0.9rem;
+              border: none;
+              cursor: pointer;
+              font-weight: 600;
+            }
+            .btn-primary {
+              background: #2563eb;
               color: #f9fafb;
-              white-space: nowrap;
             }
-            
-            .route-sub-line {
-              font-size: 0.82rem;
-              color: #4b5563;
-              margin-left: 2.1rem; /* lines up under the logo pill */
+            .btn-primary:hover {
+              background: #1d4ed8;
             }
-              </style>
-            </head>
-            <body>
-              <div class="container">
-                <div class="header-bar">
-                  <div class="header-left">
-                    <h1>Airport Airlines Explorer</h1>
-                    <p class="subtitle">
-                      Enter an airport code (e.g. <code>SJC</code>, <code>JFK</code>, <code>ATL</code>)
-                      to see all airlines that serve it.
-                    </p>
-                  </div>
-                  <div class="header-right">
-                    <a href="/">← Back to Route Finder</a>
-                  </div>
+
+            .badge {
+              display: inline-flex;
+              align-items: center;
+              padding: 0.2rem 0.6rem;
+              border-radius: 999px;
+              font-size: 0.75rem;
+              font-weight: 600;
+              background: #e5e7eb;
+              color: #374151;
+            }
+            .badge-entity {
+              background: #eef2ff;
+              color: #312e81;
+            }
+            .badge-op {
+              background: #eff6ff;
+              color: #1d4ed8;
+              margin-left: 0.35rem;
+            }
+
+            .hint {
+              font-size: 0.8rem;
+              color: #6b7280;
+            }
+
+            #error {
+              margin-top: 0.25rem;
+              font-size: 0.85rem;
+              color: #b91c1c;
+            }
+
+            .results-list {
+              display: grid;
+              gap: 0.75rem;
+            }
+            .card {
+              border-radius: 10px;
+              border: 1px solid #e5e7eb;
+              padding: 0.9rem 1rem;
+              background: #f9fafb;
+            }
+            .card-header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 0.35rem;
+            }
+            .card-title {
+              font-size: 0.95rem;
+              font-weight: 600;
+              color: #111827;
+            }
+            .card-body {
+              font-size: 0.85rem;
+              color: #374151;
+            }
+            .card-body dl {
+              display: grid;
+              grid-template-columns: minmax(0, 120px) minmax(0, 1fr);
+              row-gap: 0.15rem;
+              column-gap: 0.75rem;
+              margin: 0;
+            }
+            .card-body dt {
+              font-weight: 600;
+              color: #6b7280;
+            }
+            .card-body dd {
+              margin: 0;
+              word-break: break-word;
+            }
+
+            .card-success {
+              border-color: #bbf7d0;
+              background: #ecfdf3;
+            }
+            .card-error {
+              border-color: #fecaca;
+              background: #fef2f2;
+              color: #b91c1c;
+            }
+            .muted {
+              color: #6b7280;
+            }
+
+            .section-label {
+              font-size: 0.8rem;
+              font-weight: 600;
+              text-transform: uppercase;
+              letter-spacing: 0.06em;
+              color: #9ca3af;
+              margin-bottom: 0.35rem;
+            }
+
+            .checkbox-row {
+              display: flex;
+              align-items: center;
+              gap: 0.35rem;
+              margin-top: 0.15rem;
+            }
+            .checkbox-row label {
+              margin: 0;
+              font-size: 0.8rem;
+              font-weight: 500;
+            }
+
+            /* Autocomplete */
+            .autocomplete-container {
+              position: relative;
+            }
+            .autocomplete-list {
+              position: absolute;
+              top: 100%;
+              left: 0;
+              right: 0;
+              z-index: 20;
+              max-height: 14rem;
+              overflow-y: auto;
+              margin-top: 0.25rem;
+              background: #ffffff;
+              border-radius: 0.5rem;
+              border: 1px solid #e5e7eb;
+              box-shadow: 0 10px 25px rgba(15,23,42,0.15);
+              display: none;
+            }
+            .autocomplete-item {
+              padding: 0.4rem 0.6rem;
+              font-size: 0.9rem;
+              cursor: pointer;
+            }
+            .autocomplete-item:hover,
+            .autocomplete-item.active {
+              background: #f3f4f6;
+            }
+            .autocomplete-empty {
+              padding: 0.4rem 0.6rem;
+              font-size: 0.85rem;
+              color: #6b7280;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header-bar">
+              <div class="header-left">
+                <h1>Update OpenFlights Data</h1>
+                <p class="subtitle">
+                  Insert, modify, or remove Airports, Airlines, and Routes. Changes are in-memory only
+                  and immediately affect the /airport-ui, /airline-ui, and JSON APIs.
+                </p>
+              </div>
+              <div class="header-right">
+                <a href="/">← Back to Route Finder</a>
+              </div>
+            </div>
+
+            <form id="update-form">
+              <div class="field-group">
+                <div class="field" style="max-width: 220px;">
+                  <label for="entity">Entity Type</label>
+                  <select id="entity" name="entity">
+                    <option value="airport">Airport</option>
+                    <option value="airline">Airline</option>
+                    <option value="route">Route</option>
+                  </select>
                 </div>
-            
-                <form id="airport-form">
-                  <div class="field-group">
-                    <div class="field" style="max-width: 260px;">
-                      <label for="airport">Airport code (IATA)</label>
-                      <input id="airport" name="airport" type="text" maxlength="8"
-                             list="airportsList"
-                             placeholder="e.g. SJC, JFK, ATL" />
-                      <datalist id="airportsList">
-                        <!-- value is the IATA; label is the name shown in dropdown -->
-                        <option value="SJC">Norman Y. Mineta San Jose International (SJC)</option>
-                        <option value="SFO">San Francisco International (SFO)</option>
-                        <option value="LAX">Los Angeles International (LAX)</option>
-                        <option value="JFK">New York–JFK (JFK)</option>
-                        <option value="LGA">LaGuardia (LGA)</option>
-                        <option value="ORD">Chicago O'Hare (ORD)</option>
-                        <option value="MDW">Chicago Midway (MDW)</option>
-                        <option value="ATL">Hartsfield–Jackson Atlanta (ATL)</option>
-                        <option value="DFW">Dallas–Fort Worth (DFW)</option>
-                        <option value="DEN">Denver International (DEN)</option>
-                        <option value="SEA">Seattle–Tacoma (SEA)</option>
-                        <option value="PHX">Phoenix Sky Harbor (PHX)</option>
-                        <option value="LAS">Las Vegas McCarran (LAS)</option>
-                        <option value="BOS">Boston Logan (BOS)</option>
-                        <option value="MCO">Orlando International (MCO)</option>
-                      </datalist>
-                    </div>
-                    <div class="field" style="max-width: 120px;">
-                      <label for="limit">Max airlines</label>
-                      <input id="limit" name="limit" type="number" min="1" value="50" />
-                    </div>
-                  </div>
-                  <button type="submit" class="btn btn-primary">
-                    Search Airport Airlines
-                  </button>
-                  <div id="error"></div>
-                  <div class="hint">
-                    Uses the <code>/airport/routes?code=XX</code> API from the server.
-                  </div>
-                </form>
-            
-                <h3>Results</h3>
-            
-                <div class="view-mode-tabs" id="viewModeTabs">
-                  <button class="view-tab active" data-mode="cards">Cards</button>
-                  <button class="view-tab" data-mode="json">JSON</button>
-                </div>
-            
-                <div id="resultsList" class="results-list">
-                  <p class="no-results">(no results yet)</p>
+                <div class="field" style="max-width: 220px;">
+                  <label for="operation">Operation</label>
+                  <select id="operation" name="operation">
+                    <option value="insert">Insert</option>
+                    <option value="modify">Modify</option>
+                    <option value="remove">Remove</option>
+                  </select>
                 </div>
               </div>
-            
-              <script>
-                (function () {
-                  const form = document.getElementById("airport-form");
-                  const airportInput = document.getElementById("airport");
-                  const limitInput = document.getElementById("limit");
-                  const errorEl = document.getElementById("error");
-                  const resultsList = document.getElementById("resultsList");
-            
-                  const viewModeTabs = document.getElementById("viewModeTabs");
-                  const viewTabButtons = viewModeTabs.querySelectorAll(".view-tab");
-            
-                  let viewMode = "cards";   // "cards" | "json"
-                  let lastData = null;      // last JSON from /airport/routes
-                  let lastTotalAirlines = 0;
-            
-                  function setError(msg) {
-                    errorEl.textContent = msg || "";
-                  }
-            
-                  function clearResults() {
-                    resultsList.innerHTML = "";
-                  }
-            
-                  function updateViewTabs() {
-                    viewTabButtons.forEach(btn => {
-                      const mode = btn.getAttribute("data-mode");
-                      if (mode === viewMode) btn.classList.add("active");
-                      else btn.classList.remove("active");
-                    });
-                  }
-            
-                  viewTabButtons.forEach(btn => {
-                    btn.addEventListener("click", () => {
-                      const mode = btn.getAttribute("data-mode");
-                      if (mode === viewMode) return;
-                      viewMode = mode;
-                      updateViewTabs();
-                      renderForCurrentMode();
-                    });
+
+              <div class="section-label">Fields</div>
+              <div id="dynamicFields"></div>
+
+              <button type="submit" class="btn btn-primary">
+                Apply Update
+              </button>
+              <div id="error"></div>
+              <div class="hint">
+                This calls the <code>/update</code> JSON API:
+                <code>/update?entity=airport&amp;operation=modify&amp;…</code>
+              </div>
+            </form>
+
+            <div class="section-label">Result</div>
+            <div id="updateResults" class="results-list">
+              <div class="card muted">
+                <div class="card-header">
+                  <span class="card-title">No updates yet</span>
+                </div>
+                <div class="card-body">
+                  Submit an update to see the <strong>Before</strong> and <strong>After</strong> cards here.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <script>
+            (function () {
+              const form         = document.getElementById("update-form");
+              const entitySelect = document.getElementById("entity");
+              const opSelect     = document.getElementById("operation");
+              const fieldsRoot   = document.getElementById("dynamicFields");
+              const errorEl      = document.getElementById("error");
+              const resultsRoot  = document.getElementById("updateResults");
+
+              let activeList = null;
+              let activeIndex = -1;
+
+              // Safety check: if these are null, nothing else will work
+              if (!form || !entitySelect || !opSelect || !fieldsRoot || !resultsRoot) {
+                console.error("Update UI: one or more required elements not found");
+                return;
+              }
+
+              function renderFields() {
+                const entity = entitySelect.value;
+                console.log("renderFields called for entity:", entity); // DEBUG
+                let html = "";
+
+                if (entity === "airport") {
+                  html += `
+                    <div class="field-group">
+                      <div class="field autocomplete-container">
+                        <label>Search Airport (name or IATA)</label>
+                        <input id="searchAirportInput" type="text"
+                               placeholder="Start typing an airport…" autocomplete="off" />
+                        <div id="searchAirportList" class="autocomplete-list"></div>
+                        <div class="hint">
+                          Select an airport to auto-fill ID and details (handy for modify/remove).
+                        </div>
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field" style="max-width:150px;">
+                        <label>Airport ID (required for modify/remove)</label>
+                        <input name="id" type="number" placeholder="e.g. 3364" />
+                      </div>
+                      <div class="field" style="max-width:150px;">
+                        <label>IATA code</label>
+                        <input name="iata" maxlength="3" placeholder="e.g. SJC" />
+                      </div>
+                      <div class="field">
+                        <label>Name</label>
+                        <input name="name" placeholder="e.g. San Jose International" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>City</label>
+                        <input name="city" placeholder="e.g. San Jose" />
+                      </div>
+                      <div class="field">
+                        <label>Country</label>
+                        <input name="country" placeholder="e.g. United States" />
+                      </div>
+                      <div class="field">
+                        <label>ICAO</label>
+                        <input name="icao" maxlength="4" placeholder="e.g. KSJC" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Latitude</label>
+                        <input name="latitude" type="text" placeholder="e.g. 37.3626" />
+                      </div>
+                      <div class="field">
+                        <label>Longitude</label>
+                        <input name="longitude" type="text" placeholder="-121.9290" />
+                      </div>
+                      <div class="field">
+                        <label>Altitude (ft)</label>
+                        <input name="altitude" type="number" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Timezone offset</label>
+                        <input name="timezone" type="text" placeholder="-8" />
+                      </div>
+                      <div class="field">
+                        <label>DST</label>
+                        <input name="dst" maxlength="2" placeholder="e.g. U" />
+                      </div>
+                      <div class="field">
+                        <label>TZDB timezone</label>
+                        <input name="tzdbTimezone" placeholder="e.g. America/Los_Angeles" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Type</label>
+                        <input name="type" placeholder="airport / station / port" />
+                      </div>
+                      <div class="field">
+                        <label>Source</label>
+                        <input name="source" placeholder="e.g. OurAirports" />
+                      </div>
+                    </div>
+                  `;
+                } else if (entity === "airline") {
+                  html += `
+                    <div class="field-group">
+                      <div class="field autocomplete-container">
+                        <label>Search Airline (name or code)</label>
+                        <input id="searchAirlineInput" type="text"
+                               placeholder="Start typing an airline…" autocomplete="off" />
+                        <div id="searchAirlineList" class="autocomplete-list"></div>
+                        <div class="hint">
+                          Select an airline to auto-fill ID and details (handy for modify/remove).
+                        </div>
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field" style="max-width:150px;">
+                        <label>Airline ID (required for modify/remove)</label>
+                        <input name="id" type="number" placeholder="e.g. 5209" />
+                      </div>
+                      <div class="field" style="max-width:150px;">
+                        <label>IATA code</label>
+                        <input name="iata" maxlength="3" placeholder="e.g. AA" />
+                      </div>
+                      <div class="field">
+                        <label>Name</label>
+                        <input name="name" placeholder="e.g. American Airlines" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Alias</label>
+                        <input name="alias" />
+                      </div>
+                      <div class="field">
+                        <label>ICAO</label>
+                        <input name="icao" maxlength="4" placeholder="e.g. AAL" />
+                      </div>
+                      <div class="field">
+                        <label>Callsign</label>
+                        <input name="callsign" placeholder="e.g. AMERICAN" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Country</label>
+                        <input name="country" placeholder="e.g. United States" />
+                      </div>
+                      <div class="field">
+                        <label>Active</label>
+                        <select name="active">
+                          <option value="">(leave unchanged)</option>
+                          <option value="true">Active (Y)</option>
+                          <option value="false">Inactive (N)</option>
+                        </select>
+                      </div>
+                    </div>
+                  `;
+                } else if (entity === "route") {
+                  html += `
+                    <div class="field-group">
+                      <div class="field" style="max-width:150px;">
+                        <label>Airline code (IATA/ICAO)</label>
+                        <input name="airline" maxlength="3" placeholder="e.g. UA" />
+                      </div>
+                      <div class="field" style="max-width:150px%;">
+                        <label>Source airport (IATA)</label>
+                        <input name="src" maxlength="3" placeholder="e.g. SFO" />
+                      </div>
+                      <div class="field" style="max-width:150px;">
+                        <label>Destination airport (IATA)</label>
+                        <input name="dst" maxlength="3" placeholder="e.g. JFK" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Stops</label>
+                        <input name="stops" type="number" placeholder="0" />
+                      </div>
+                      <div class="field">
+                        <label>Equipment</label>
+                        <input name="equipment" placeholder="e.g. 738 739" />
+                      </div>
+                      <div class="field">
+                        <label>Codeshare</label>
+                        <div class="checkbox-row">
+                          <input id="codeshareChk" name="codeshare" type="checkbox" />
+                          <label for="codeshareChk">Codeshare (Y)</label>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="hint">
+                      For <strong>modify</strong> and <strong>remove</strong>, the combination
+                      (airline, src, dst) identifies the route. Modify currently lets you
+                      update stops, equipment, and codeshare.
+                    </div>
+                  `;
+                }
+
+                fieldsRoot.innerHTML = html;
+                setupEntitySpecificBehaviour();
+              }
+
+              function clearResults() {
+                resultsRoot.innerHTML = `
+                  <div class="card muted">
+                    <div class="card-header">
+                      <span class="card-title">No updates yet</span>
+                    </div>
+                    <div class="card-body">
+                      Submit an update to see the <strong>Before</strong> and <strong>After</strong> cards here.
+                    </div>
+                  </div>
+                `;
+              }
+
+              function renderEntitySummary(entity, obj) {
+                if (!obj) return "<p class=\"muted\">(no data)</p>";
+
+                function row(label, value) {
+                  if (value === undefined || value === null || value === "") return "";
+                  return `<dt>${label}</dt><dd>${String(value)}</dd>`;
+                }
+
+                if (entity === "airport") {
+                  return `
+                    <dl>
+                      ${row("ID", obj.id)}
+                      ${row("IATA", obj.iata)}
+                      ${row("ICAO", obj.icao)}
+                      ${row("Name", obj.name)}
+                      ${row("City", obj.city)}
+                      ${row("Country", obj.country)}
+                      ${row("Latitude", obj.latitude)}
+                      ${row("Longitude", obj.longitude)}
+                      ${row("Altitude", obj.altitude)}
+                      ${row("Timezone", obj.timezone)}
+                      ${row("DST", obj.dst)}
+                      ${row("TZDB", obj.tzdbTimezone)}
+                      ${row("Type", obj.type)}
+                      ${row("Source", obj.source)}
+                    </dl>
+                  `;
+                } else if (entity === "airline") {
+                  return `
+                    <dl>
+                      ${row("ID", obj.id)}
+                      ${row("IATA", obj.iata)}
+                      ${row("ICAO", obj.icao)}
+                      ${row("Name", obj.name)}
+                      ${row("Alias", obj.alias)}
+                      ${row("Callsign", obj.callsign)}
+                      ${row("Country", obj.country)}
+                      ${row("Active", obj.active)}
+                    </dl>
+                  `;
+                } else if (entity === "route") {
+                  return `
+                    <dl>
+                      ${row("Airline", obj.airline)}
+                      ${row("Airline ID", obj.airlineId)}
+                      ${row("Source", obj.srcAirport)}
+                      ${row("Destination", obj.dstAirport)}
+                      ${row("Src ID", obj.srcAirportId)}
+                      ${row("Dst ID", obj.dstAirportId)}
+                      ${row("Stops", obj.stops)}
+                      ${row("Codeshare", obj.codeshare)}
+                      ${row("Equipment", obj.equipment)}
+                    </dl>
+                  `;
+                }
+                return `<pre>${JSON.stringify(obj, null, 2)}</pre>`;
+              }
+
+              function renderResultCards(data) {
+                const entity = data.entityType || entitySelect.value;
+                const op     = data.operation   || opSelect.value;
+
+                const before = data.before || null;
+                const after  = data.after  || null;
+
+                let html = "";
+
+                if (before) {
+                  html += `
+                    <div class="card">
+                      <div class="card-header">
+                        <span class="card-title">Before Update</span>
+                        <span>
+                          <span class="badge badge-entity">${entity}</span>
+                          <span class="badge badge-op">${op}</span>
+                        </span>
+                      </div>
+                      <div class="card-body">
+                        ${renderEntitySummary(entity, before)}
+                      </div>
+                    </div>
+                  `;
+                } else if (op === "insert") {
+                  html += `
+                    <div class="card muted">
+                      <div class="card-header">
+                        <span class="card-title">Before Update</span>
+                      </div>
+                      <div class="card-body">
+                        No previous entity (insert).
+                      </div>
+                    </div>
+                  `;
+                }
+
+                if (op === "remove") {
+                  html += `
+                    <div class="card card-success">
+                      <div class="card-header">
+                        <span class="card-title">After Update</span>
+                      </div>
+                      <div class="card-body">
+                        Entity successfully removed.
+                      </div>
+                    </div>
+                  `;
+                } else if (after) {
+                  html += `
+                    <div class="card card-success">
+                      <div class="card-header">
+                        <span class="card-title">After Update</span>
+                      </div>
+                      <div class="card-body">
+                        ${renderEntitySummary(entity, after)}
+                      </div>
+                    </div>
+                  `;
+                }
+
+                resultsRoot.innerHTML = html;
+              }
+
+              function setError(msg) {
+                errorEl.textContent = msg || "";
+              }
+
+              // ---------- Autocomplete helpers ----------
+
+              async function fetchSuggestions(kind, query) {
+                if (!query || query.length < 2) return [];
+                const base = kind === "airport" ? "/airports/search" : "/airlines/search";
+                try {
+                  const resp = await fetch(base + "?q=" + encodeURIComponent(query) + "&limit=8");
+                  if (!resp.ok) return [];
+                  return await resp.json();
+                } catch (e) {
+                  console.error("autocomplete fetch error", e);
+                  return [];
+                }
+              }
+
+              function renderSuggestions(kind, items, inputEl, listEl) {
+                listEl.innerHTML = "";
+                activeList = listEl;
+                activeIndex = -1;
+
+                if (!items.length) {
+                  listEl.innerHTML = '<div class="autocomplete-empty">No matches</div>';
+                  listEl.style.display = "block";
+                  return;
+                }
+
+                items.forEach((obj) => {
+                  const div = document.createElement("div");
+                  div.className = "autocomplete-item";
+                  const display = obj.display || obj.name || obj.code || "";
+                  div.textContent = display;
+                  div.dataset.code = obj.code || "";
+
+                  div.addEventListener("click", () => {
+                    inputEl.value = display;
+                    listEl.style.display = "none";
+                    listEl.innerHTML = "";
+                    const code = div.dataset.code;
+                    if (code) {
+                      if (kind === "airport") {
+                        loadAirportDetails(code);
+                      } else if (kind === "airline") {
+                        loadAirlineDetails(code);
+                      }
+                    }
                   });
-            
-                  
-            // --- Airline logo + pill helpers (same behavior as airline-ui) ---
-            function getAirlineLogoUrl(code) {
-              if (!code || code === "\\N") {
-                // simple placeholder if unknown
-                return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
+
+                  listEl.appendChild(div);
+                });
+
+                listEl.style.display = "block";
               }
-              // Kiwi pattern for airline logos by IATA code
-              return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
-            }
-            
-            function airlineDisplayName(al) {
-              if (!al) return "Unknown airline";
-              const code = al.iata || al.icao || al.code || "";
-              const base = al.name || code || "Unknown airline";
-              return code ? base + " (" + code + ")" : base;
-            }
-            
-            function renderAirlinePillFromData(entry) {
-              const al   = entry.airline || {};
-              const code = al.iata || al.icao || al.code || "";
-              const name = airlineDisplayName(al);
-            
-              const logoUrl = code ? getAirlineLogoUrl(code) : "";
-            
-              if (logoUrl) {
-                return (
-                  '<span class="airline-pill">' +
-                    '<img class="airline-pill-logo" src="' + logoUrl + '" alt="' + code + ' logo" />' +
-                    '<span class="airline-pill-name">' + name + "</span>" +
-                  "</span>"
-                );
+
+              async function handleAutocompleteInput(kind, inputEl, listEl) {
+                const query = (inputEl.value || "").trim();
+                if (query.length < 2) {
+                  listEl.style.display = "none";
+                  listEl.innerHTML = "";
+                  return;
+                }
+                const items = await fetchSuggestions(kind, query);
+                if ((inputEl.value || "").trim() === query) {
+                  renderSuggestions(kind, items, inputEl, listEl);
+                }
               }
-            
-              const initial = (name || code || "?").charAt(0).toUpperCase();
-              return (
-                '<span class="airline-pill">' +
-                  '<span class="airline-pill-fallback">' + initial + "</span>" +
-                  '<span class="airline-pill-name">' + name + "</span>" +
-                "</span>"
-              );
-            }
-            
-            
-            
-                  function renderCards(data) {
-                    clearResults();
-            
-                    if (!data || !data.airport) {
-                      resultsList.innerHTML =
-                        '<p class="no-results">No results to display yet.</p>';
-                      return;
-                    }
-            
-                    const airport = data.airport;
-                    const airlines = data.airlines || [];
-            
-                    if (!airlines.length) {
-                      resultsList.innerHTML =
-                        '<p class="no-results">No airlines in the dataset for this airport.</p>';
-                      return;
-                    }
-            
-                    // Airport summary card
-                    const summary = document.createElement("div");
-                    summary.className = "card";
-                    const code = airport.iata || airport.icao || "";
-                    const locBits = [];
-                    if (airport.city) locBits.push(airport.city);
-                    if (airport.country) locBits.push(airport.country);
-            
-                    summary.innerHTML =
-                      '<div class="main-line">' +
-                        '<span class="name-text">' + (airport.name || "Unknown airport") + '</span>' +
-                        (code ? '<span class="pill">' + code + "</span>" : "") +
-                      "</div>" +
-                      '<div class="sub-line">' +
-                        (locBits.length ? "<span>" + locBits.join(", ") + "</span>" : "") +
-                        '<span>Total airlines in dataset: ' + lastTotalAirlines + "</span>" +
-                      "</div>";
-            
-                    resultsList.appendChild(summary);
-            
-                    airlines.forEach(function (entry) {
-                      const al = entry.airline || {};
-                      const count = entry.routes || 0;
-                      const country = al.country || "";
-            
-                      const card = document.createElement("div");
-                      card.className = "route-card";
-                      card.innerHTML =
-                        '<div class="route-main-line">' +
-                          renderAirlinePillFromData(entry) +
-                          '<span class="route-tag">' + count + ' route' + (count === 1 ? "" : "s") + "</span>" +
-                        "</div>" +
-                        '<div class="route-sub-line">' +
-                          (country ? "<span>Country: " + country + "</span>" : "") +
-                        "</div>";
-            
-                      resultsList.appendChild(card);
-                    });
+
+              function handleAutocompleteKeydown(e, inputEl, listEl) {
+                if (listEl.style.display === "none") return;
+
+                const items = listEl.querySelectorAll(".autocomplete-item");
+                if (!items.length) return;
+
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  if (activeList !== listEl) {
+                    activeList = listEl;
+                    activeIndex = -1;
                   }
-            
-                  function renderJson() {
-                    clearResults();
-            
-                    if (!lastData) {
-                      resultsList.innerHTML =
-                        '<p class="no-results">(run a search to see JSON)</p>';
-                      return;
-                    }
-            
-                    const jsonStr = JSON
-                      .stringify(lastData, null, 2)
-                      .replace(/</g, "&lt;");
-            
-                    resultsList.innerHTML =
-                      '<pre style="background:#020617;color:#e5e7eb;' +
-                      'padding:0.75rem;border-radius:0.5rem;font-size:0.8rem;' +
-                      'overflow:auto;max-height:24rem;">' +
-                      jsonStr +
-                      "</pre>";
-                  }
-            
-                  function renderForCurrentMode() {
-                    if (viewMode === "json") renderJson();
-                    else renderCards(lastData);
-                  }
-            
-                  form.addEventListener("submit", function (e) {
+                  const dir = e.key === "ArrowDown" ? 1 : -1;
+                  activeIndex = (activeIndex + dir + items.length) % items.length;
+                  items.forEach(el => el.classList.remove("active"));
+                  items[activeIndex].classList.add("active");
+                  items[activeIndex].scrollIntoView({ block: "nearest" });
+                } else if (e.key === "Enter") {
+                  if (activeIndex >= 0) {
                     e.preventDefault();
-                    setError("");
-            
-                    let code = (airportInput.value || "").trim().toUpperCase();
-                    if (!code) {
-                      setError("Please enter an airport code (e.g. SJC, JFK, ATL).");
-                      return;
-                    }
-            
-                    // If user typed "SJC - San Jose", grab the first token
-                    const parts = code.split(/\s+/);
-                    if (parts.length > 1) {
-                      code = parts[0];
-                    }
-            
-                    let limit = parseInt((limitInput.value || "").trim(), 10);
-                    if (isNaN(limit) || limit <= 0) {
-                      limit = 50;
-                      limitInput.value = "50";
-                    }
-            
-                    clearResults();
-                    resultsList.innerHTML =
-                      '<p class="no-results">Loading airport airlines…</p>';
-            
-                    fetch("/airport/routes?code=" + encodeURIComponent(code))
-                      .then(resp => {
-                        if (!resp.ok) {
-                          return resp.text().then(text => {
-                            throw new Error("Server returned " + resp.status + ": " + text);
-                          });
-                        }
-                        return resp.json();
-                      })
-                      .then(data => {
-                        if (data && typeof data === "object" && data.error) {
-                          setError("Server error: " + data.error);
-                          clearResults();
-                          return;
-                        }
-            
-                        // Remember the total airline count BEFORE limiting
-                        const airlinesArr = Array.isArray(data.airlines) ? data.airlines : [];
-                        lastTotalAirlines = airlinesArr.length;
-            
-                        // Apply client-side limit for display
-                        let limitedAirlines = airlinesArr;
-                        if (airlinesArr.length > limit) {
-                          limitedAirlines = airlinesArr.slice(0, limit);
-                        }
-            
-                        lastData = Object.assign({}, data, { airlines: limitedAirlines });
-            
-                        viewMode = "cards";
-                        updateViewTabs();
-                        renderCards(lastData);
-                      })
-                      .catch(err => {
-                        console.error(err);
-                        setError("Request failed. Please try again.");
-                        clearResults();
-                      });
+                    items[activeIndex].click();
+                  }
+                } else if (e.key === "Escape") {
+                  listEl.style.display = "none";
+                }
+              }
+
+              async function loadAirportDetails(code) {
+                try {
+                  const resp = await fetch("/airport?code=" + encodeURIComponent(code));
+                  if (!resp.ok) {
+                    setError("Airport " + code + " not found");
+                    return;
+                  }
+                  const data = await resp.json();
+                  populateAirportForm(data);
+                  setError("");
+                } catch (e) {
+                  console.error(e);
+                  setError("Failed to load airport details");
+                }
+              }
+
+              async function loadAirlineDetails(code) {
+                try {
+                  const resp = await fetch("/airline?code=" + encodeURIComponent(code));
+                  if (!resp.ok) {
+                    setError("Airline " + code + " not found");
+                    return;
+                  }
+                  const data = await resp.json();
+                  populateAirlineForm(data);
+                  setError("");
+                } catch (e) {
+                  console.error(e);
+                  setError("Failed to load airline details");
+                }
+              }
+
+              function populateAirportForm(ap) {
+                const f = form.elements;
+                if (!f) return;
+
+                if (f.id)            f.id.value            = (ap.id != null ? ap.id : "");
+                if (f.iata)          f.iata.value          = ap.iata || "";
+                if (f.name)          f.name.value          = ap.name || "";
+                if (f.city)          f.city.value          = ap.city || "";
+                if (f.country)       f.country.value       = ap.country || "";
+                if (f.icao)          f.icao.value          = ap.icao || "";
+                if (f.latitude)      f.latitude.value      = (ap.latitude != null ? ap.latitude : "");
+                if (f.longitude)     f.longitude.value     = (ap.longitude != null ? ap.longitude : "");
+                if (f.altitude)      f.altitude.value      = (ap.altitude != null ? ap.altitude : "");
+                if (f.timezone)      f.timezone.value      = (ap.timezone != null ? ap.timezone : "");
+                if (f.dst)           f.dst.value           = ap.dst || "";
+                if (f.tzdbTimezone)  f.tzdbTimezone.value  = ap.tzdbTimezone || "";
+                if (f.type)          f.type.value          = ap.type || "";
+                if (f.source)        f.source.value        = ap.source || "";
+
+                if (opSelect.value === "insert" && f.id) {
+                  f.id.value = "";
+                }
+              }
+
+              function populateAirlineForm(al) {
+                const f = form.elements;
+                if (!f) return;
+
+                if (f.id)       f.id.value       = (al.id != null ? al.id : "");
+                if (f.iata)     f.iata.value     = al.iata || "";
+                if (f.name)     f.name.value     = al.name || "";
+                if (f.alias)    f.alias.value    = al.alias || "";
+                if (f.icao)     f.icao.value     = al.icao || "";
+                if (f.callsign) f.callsign.value = al.callsign || "";
+                if (f.country)  f.country.value  = al.country || "";
+                if (f.active)   f.active.value   = (al.active ? "true" : "false");
+
+                if (opSelect.value === "insert" && f.id) {
+                  f.id.value = "";
+                }
+              }
+
+              function setupEntitySpecificBehaviour() {
+                const entity = entitySelect.value;
+
+                if (entity === "airport") {
+                  const input = document.getElementById("searchAirportInput");
+                  const list  = document.getElementById("searchAirportList");
+                  if (input && list) {
+                    input.addEventListener("input", () => {
+                      handleAutocompleteInput("airport", input, list);
+                    });
+                    input.addEventListener("keydown", (e) => {
+                      handleAutocompleteKeydown(e, input, list);
+                    });
+                  }
+                } else if (entity === "airline") {
+                  const input = document.getElementById("searchAirlineInput");
+                  const list  = document.getElementById("searchAirlineList");
+                  if (input && list) {
+                    input.addEventListener("input", () => {
+                      handleAutocompleteInput("airline", input, list);
+                    });
+                    input.addEventListener("keydown", (e) => {
+                      handleAutocompleteKeydown(e, input, list);
+                    });
+                  }
+                }
+              }
+
+              // Hide autocomplete lists when clicking outside
+              document.addEventListener("click", (e) => {
+                if (!e.target.closest(".autocomplete-container")) {
+                  document.querySelectorAll(".autocomplete-list").forEach((el) => {
+                    el.style.display = "none";
                   });
-                })();
-              </script>
-            </body>
-            </html>
-            )HTML";
+                }
+              });
+
+              // ---------- Submit handler ----------
+              form.addEventListener("submit", function (e) {
+                e.preventDefault();
+                setError("");
+
+                const entity = entitySelect.value;
+                const op     = opSelect.value;
+
+                const params = new URLSearchParams();
+                params.set("entity", entity);
+                params.set("operation", op);
+
+                const inputs = fieldsRoot.querySelectorAll("input, select, textarea");
+                inputs.forEach(function (el) {
+                  const name = el.name;
+                  if (!name) return;
+
+                  if (el.type === "checkbox") {
+                    if (el.checked) {
+                      params.set(name, "true");
+                    }
+                    return;
+                  }
+
+                  const value = (el.value || "").trim();
+                  if (value !== "") {
+                    params.set(name, value);
+                  }
+                });
+
+                resultsRoot.innerHTML = `
+                  <div class="card muted">
+                    <div class="card-header">
+                      <span class="card-title">Applying update…</span>
+                    </div>
+                    <div class="card-body">
+                      Please wait while the server validates and applies your change.
+                    </div>
+                  </div>
+                `;
+
+                fetch("/update?" + params.toString())
+                  .then(function (resp) {
+                    if (!resp.ok) {
+                      return resp.text().then(function (text) {
+                        throw new Error("Server returned " + resp.status + ": " + text);
+                      });
+                    }
+                    return resp.json();
+                  })
+                  .then(function (data) {
+                    if (!data || typeof data !== "object") {
+                      throw new Error("Malformed response from /update");
+                    }
+                    if (!data.success) {
+                      setError(data.error || "Update failed.");
+                      resultsRoot.innerHTML = `
+                        <div class="card card-error">
+                          <div class="card-header">
+                            <span class="card-title">Update failed</span>
+                          </div>
+                          <div class="card-body">
+                            ${data.error ? data.error : "An unknown error occurred."}
+                          </div>
+                        </div>
+                      `;
+                    } else {
+                      setError("");
+                      renderResultCards(data);
+                    }
+                  })
+                  .catch(function (err) {
+                    console.error(err);
+                    setError("Request failed: " + err.message);
+                    resultsRoot.innerHTML = `
+                      <div class="card card-error">
+                        <div class="card-header">
+                          <span class="card-title">Request error</span>
+                        </div>
+                        <div class="card-body">
+                          ${err.message}
+                        </div>
+                      </div>
+                    `;
+                  });
+              });
+
+              // Wire up dropdown changes
+              entitySelect.addEventListener("change", renderFields);
+              opSelect.addEventListener("change", renderFields);
+
+              // Initial fields + result state
+              renderFields();
+              clearResults();
+            })();
+          </script>
+        </body>
+        </html>
+        )HTML";
             response = buildHttpResponse(body, "text/html; charset=UTF-8");
-            
         }
+        else if (pathOnly == "/airport-ui" || pathOnly == "/airport-ui/") {
+                    std::string body = R"HTML(
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                      <meta charset="UTF-8" />
+                      <title>Airport Airlines Explorer</title>
+                      <meta name="viewport" content="width=device-width, initial-scale=1" />
+                      <link href="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.css" rel="stylesheet" />
+                      <script src="https://api.mapbox.com/mapbox-gl-js/v3.4.0/mapbox-gl.js"></script>
+                      <style>
+                        body {
+                          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                          margin: 0;
+                          padding: 1.5rem;
+                          background: #f5f5f5;
+                          color: #222;
+                        }
+                        .container {
+                          max-width: 880px;
+                          margin: 0 auto;
+                          background: #ffffff;
+                          border-radius: 12px;
+                          padding: 1.5rem 1.75rem 1.75rem;
+                          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+                        }
+                        .header-bar {
+                          display: flex;
+                          justify-content: space-between;
+                          align-items: center;
+                          gap: 1rem;
+                          margin-bottom: 0.75rem;
+                        }
+                        .header-left h1 {
+                          margin: 0;
+                          font-size: 1.7rem;
+                        }
+                        .subtitle {
+                          font-size: 0.85rem;
+                          color: #6b7280;
+                          margin-top: 0.15rem;
+                        }
+                        .header-right a {
+                          font-size: 0.8rem;
+                          text-decoration: none;
+                          padding: 0.35rem 0.65rem;
+                          border-radius: 999px;
+                          border: 1px solid #e5e7eb;
+                          color: #374151;
+                          background: #f9fafb;
+                        }
+                        .header-right a:hover {
+                          background: #e5e7eb;
+                        }
+                        form {
+                          display: grid;
+                          gap: 0.75rem;
+                          margin-bottom: 1rem;
+                        }
+                        .field-group {
+                          display: flex;
+                          flex-wrap: wrap;
+                          gap: 0.75rem;
+                        }
+                        .field {
+                          display: flex;
+                          flex-direction: column;
+                          min-width: 140px;
+                          flex: 1 1 0;
+                        }
+                        label {
+                          font-size: 0.8rem;
+                          font-weight: 600;
+                          margin-bottom: 0.25rem;
+                          text-transform: uppercase;
+                          letter-spacing: 0.06em;
+                        }
+
+                        input[type="text"],
+                        input[type="number"] {
+                          padding: 0.4rem 0.5rem;
+                          border-radius: 6px;
+                          border: 1px solid #d1d5db;
+                          font-size: 0.95rem;
+                        }
+                        .btn {
+                          padding: 0.45rem 0.9rem;
+                          border-radius: 999px;
+                          border: none;
+                          font-size: 0.95rem;
+                          font-weight: 600;
+                          cursor: pointer;
+                          display: inline-flex;
+                          align-items: center;
+                          gap: 0.25rem;
+                        }
+                        .btn-primary {
+                          background: #2563eb;
+                          color: #ffffff;
+                        }
+                        .btn-primary:hover {
+                          background: #1d4ed8;
+                        }
+                        #error {
+                          margin-top: 0.25rem;
+                          color: #b91c1c;
+                          font-size: 0.9rem;
+                        }
+                        .hint {
+                          font-size: 0.85rem;
+                          color: #6b7280;
+                          margin-top: 0.25rem;
+                        }
+                        h3 {
+                          margin-top: 1.25rem;
+                          margin-bottom: 0.5rem;
+                          font-size: 1.05rem;
+                        }
+                        .results-list {
+                          margin-top: 0.5rem;
+                          display: flex;
+                          flex-direction: column;
+                          gap: 0.75rem;
+                        }
+                        .card {
+                          background: #ffffff;
+                          border-radius: 12px;
+                          padding: 0.75rem 1rem;
+                          box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+                          font-size: 0.93rem;
+                        }
+                        .main-line {
+                          display: flex;
+                          align-items: center;
+                          gap: 0.4rem;
+                          font-weight: 600;
+                          margin-bottom: 0.25rem;
+                        }
+                        .name-text {
+                          font-size: 0.96rem;
+                        }
+                        .pill {
+                          font-size: 0.72rem;
+                          font-weight: 600;
+                          padding: 0.1rem 0.55rem;
+                          border-radius: 999px;
+                          margin-left: 0.2rem;
+                          white-space: nowrap;
+                          background: #e8f0fe;
+                          color: #174ea6;
+                        }
+                        .sub-line {
+                          font-size: 0.83rem;
+                          color: #4b5563;
+                          display: flex;
+                          flex-wrap: wrap;
+                          gap: 0.4rem;
+                        }
+                        .no-results {
+                          font-size: 0.9rem;
+                          color: #6b7280;
+                        }
+
+                        .view-mode-tabs {
+                          display: inline-flex;
+                          gap: 0.25rem;
+                          margin-top: 2.0rem;
+                          margin-bottom: 0.45rem;
+                          font-size: 0.8rem;
+                        }
+                        .view-tab {
+                          border: none;
+                          cursor: pointer;
+                          background: #e5e7eb;
+                          color: #111827;
+                          padding: 0.15rem 0.7rem;
+                          border-radius: 999px;
+                          font-weight: 500;
+                        }
+                        .view-tab.active {
+                          background: #111827;
+                          color: #f9fafb;
+                        }
+
+                        /* Map container */
+                        #airportRouteMap {
+                          height: 400px;
+                          margin-top: 1.25rem;
+                          margin-bottom: 0.75rem;
+                          border-radius: 8px;
+                          overflow: hidden;
+                        }
+
+                        /* Airline pill (same style as airline-ui) */
+                        .airline-pill {
+                          display: inline-flex;
+                          align-items: center;
+                          background: #f1f5f9;
+                          color: #1e293b;
+                          padding: 0.15rem 0.6rem 0.15rem 0.25rem;
+                          border-radius: 999px;
+                          font-size: 0.78rem;
+                          font-weight: 500;
+                          margin-right: 0.4rem;
+                          white-space: nowrap;
+                          line-height: 1;
+                        }
+                        .airline-pill img {
+                          height: 1.25rem;
+                          width: 1.25rem;
+                          border-radius: 50%;
+                          object-fit: contain;
+                          margin-right: 0.35rem;
+                          background: #ffffff;
+                          border: 1px solid #e2e8f0;
+                          flex-shrink: 0;
+                        }
+                        .airline-pill-fallback {
+                          width: 22px;
+                          height: 22px;
+                          border-radius: 999px;
+                          display: inline-flex;
+                          align-items: center;
+                          justify-content: center;
+                          font-size: 0.8rem;
+                          font-weight: 600;
+                          background: #4f46e5;
+                          color: #f9fafb;
+                        }
+                        .airline-pill-name {
+                          white-space: nowrap;
+                        }
+
+                        /* Per-airline rows under the airport summary */
+                        .route-card {
+                          background: #ffffff;
+                          border-radius: 12px;
+                          padding: 0.55rem 0.85rem;
+                          box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
+                          border: 1px solid #e5e7eb;
+                          display: flex;
+                          flex-direction: column;
+                          gap: 0.15rem;
+                          font-size: 0.9rem;
+                        }
+                        .route-card.selectable {
+                          cursor: pointer;
+                          transition: box-shadow 0.18s ease, transform 0.18s ease, border-color 0.18s ease;
+                        }
+                        .route-card.selectable:hover {
+                          box-shadow: 0 4px 10px rgba(15, 23, 42, 0.12);
+                          transform: translateY(-1px);
+                          border-color: #93c5fd;
+                        }
+                        .route-card.selectable.selected {
+                          border-color: #2563eb;
+                          box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.65);
+                        }
+
+                        .route-main-line {
+                          display: flex;
+                          align-items: center;
+                          justify-content: space-between;
+                          gap: 0.75rem;
+                        }
+                        .route-tag {
+                          font-size: 0.78rem;
+                          font-weight: 600;
+                          padding: 0.1rem 0.55rem;
+                          border-radius: 999px;
+                          background: #111827;
+                          color: #f9fafb;
+                          white-space: nowrap;
+                        }
+                        .route-sub-line {
+                          font-size: 0.82rem;
+                          color: #4b5563;
+                          margin-left: 2.1rem;
+                        }
+
+                        .airline-summary-right {
+                          margin-left: auto;
+                          display: flex;
+                          flex-direction: column;
+                          align-items: flex-end;
+                          gap: 0.2rem;
+                        }
+
+                        .status-pill {
+                          display: inline-flex;
+                          align-items: center;
+                          padding: 0.15rem 0.7rem;
+                          border-radius: 999px;
+                          font-size: 0.78rem;
+                          font-weight: 500;
+                          white-space: nowrap;
+                          margin-top: 0.05rem;
+                        }
+                        .status-pill.active {
+                          background: #111827;
+                          color: #f9fafb;
+                        }
+                        .status-pill.inactive {
+                          background: #e5e7eb;
+                          color: #4b5563;
+                        }
+
+                        /* Expanded airline details under each card */
+                        .airline-details {
+                          margin-top: 0.5rem;
+                          padding-top: 0.5rem;
+                          border-top: 1px solid #e5e7eb;
+                          display: none;
+                        }
+                        .airport-flow-section {
+                          margin-top: 0.75rem;
+                        }
+                        .airport-flow-title {
+                          font-size: 0.78rem;
+                          font-weight: 600;
+                          text-transform: uppercase;
+                          letter-spacing: 0.06em;
+                          color: #6b7280;
+                          margin-bottom: 0.35rem;
+                        }
+                        .flows-grid {
+                          display: grid;
+                          grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+                          column-gap: 1.75rem;
+                          row-gap: 0.2rem;
+                          font-size: 0.86rem;
+                        }
+                        .flow-item {
+                          white-space: nowrap;
+                          overflow: hidden;
+                          text-overflow: ellipsis;
+                        }
+                        .airline-details-empty {
+                          font-style: italic;
+                          color: #9ca3af;
+                          font-size: 0.82rem;
+                        }
+                      </style>
+                    </head>
+                    <body>
+                      <div class="container">
+                        <div class="header-bar">
+                          <div class="header-left">
+                            <h1>Airport Airlines Explorer</h1>
+                            <p class="subtitle">
+                              Enter an airport code (e.g. <code>SJC</code>, <code>JFK</code>, <code>ATL</code>)
+                              to see all airlines that serve it.
+                            </p>
+                          </div>
+                          <div class="header-right">
+                            <a href="/">← Back to Route Finder</a>
+                          </div>
+                        </div>
+
+                        <form id="airport-form">
+                          <div class="field-group">
+                            <div class="field" style="max-width: 260px;">
+                              <label for="airport">Airport code (IATA)</label>
+                              <input id="airport" name="airport" type="text" maxlength="8"
+                                     list="airportsList"
+                                     placeholder="e.g. SJC, JFK, ATL" />
+                              <datalist id="airportsList">
+                                <option value="SJC">Norman Y. Mineta San Jose International (SJC)</option>
+                                <option value="SFO">San Francisco International (SFO)</option>
+                                <option value="LAX">Los Angeles International (LAX)</option>
+                                <option value="JFK">New York–JFK (JFK)</option>
+                                <option value="LGA">LaGuardia (LGA)</option>
+                                <option value="ORD">Chicago O'Hare (ORD)</option>
+                                <option value="MDW">Chicago Midway (MDW)</option>
+                                <option value="ATL">Hartsfield–Jackson Atlanta (ATL)</option>
+                                <option value="DFW">Dallas–Fort Worth (DFW)</option>
+                                <option value="DEN">Denver International (DEN)</option>
+                                <option value="SEA">Seattle–Tacoma (SEA)</option>
+                                <option value="PHX">Phoenix Sky Harbor (PHX)</option>
+                                <option value="LAS">Las Vegas McCarran (LAS)</option>
+                                <option value="BOS">Boston Logan (BOS)</option>
+                                <option value="MCO">Orlando International (MCO)</option>
+                              </datalist>
+                            </div>
+                            <div class="field" style="max-width: 120px;">
+                              <label for="limit">Max airlines</label>
+                              <input id="limit" name="limit" type="number" min="1" value="50" />
+                            </div>
+                          </div>
+                          <button type="submit" class="btn btn-primary">
+                            Search Airport Airlines
+                          </button>
+                          <div id="error"></div>
+                          <div class="hint">
+                            Uses the <code>/airport/routes?code=XX</code> API from the server.
+                          </div>
+                        </form>
+
+                        <h3>Results</h3>
+
+                        <div id="airportRouteMap"></div>
+
+                        <div class="view-mode-tabs" id="viewModeTabs">
+                          <button class="view-tab active" data-mode="cards">Cards</button>
+                          <button class="view-tab" data-mode="json">JSON</button>
+                        </div>
+
+                        <div id="resultsList" class="results-list">
+                          <p class="no-results">(no results yet)</p>
+                        </div>
+                      </div>
+
+                      <script>
+                        (function () {
+                          const form = document.getElementById("airport-form");
+                          const airportInput = document.getElementById("airport");
+                          const limitInput = document.getElementById("limit");
+                          const errorEl = document.getElementById("error");
+                          const resultsList = document.getElementById("resultsList");
+
+                          const viewModeTabs = document.getElementById("viewModeTabs");
+                          const viewTabButtons = viewModeTabs.querySelectorAll(".view-tab");
+
+                          let viewMode = "cards";
+                          let lastData = null;
+                          let lastTotalAirlines = 0;
+
+                          // Mapbox setup (same token as /airline-ui)
+                          mapboxgl.accessToken = "pk.eyJ1IjoiY2hyaXN0aW5lcnlhbjkzIiwiYSI6ImNtaWJnZDhiMDAxN2sya29sNXZvNHExMXkifQ.6K3wdjmIhFRQD3bre4f_DA";
+
+                          const INITIAL_CENTER = [-98.5, 39.8];
+                          const INITIAL_ZOOM   = 2;
+
+                          const airportMap = new mapboxgl.Map({
+                            container: "airportRouteMap",
+                            style: "mapbox://styles/mapbox/light-v11",
+                            center: INITIAL_CENTER,
+                            zoom: INITIAL_ZOOM
+                          });
+
+                          let airportMapIsLoaded = false;
+                          let airportLastGeoJsonAllAirlines = null;
+                          let airportLastGeoJsonByAirline = {};
+                          let selectedAirportAirlineCode = null;
+
+                          let airportFlowsByAirline = {};  // airlineCode -> { arrivals:[], departures:[] }
+                          let currentAirportMeta = null;
+                          let currentAirportCode = null;
+
+                          airportMap.on("load", function () {
+                            airportMapIsLoaded = true;
+                          });
+
+                          function clearAirportMapRoutes() {
+                            if (!airportMapIsLoaded) return;
+                            if (airportMap.getLayer("airport-routes-line")) {
+                              airportMap.removeLayer("airport-routes-line");
+                            }
+                            if (airportMap.getSource("airport-routes")) {
+                              airportMap.removeSource("airport-routes");
+                            }
+                          }
+
+                          function renderAirportMapRoutes(geoJsonData) {
+                            if (!airportMapIsLoaded) return;
+                            clearAirportMapRoutes();
+                            if (!geoJsonData || !geoJsonData.features || !geoJsonData.features.length) {
+                              airportMap.flyTo({ center: INITIAL_CENTER, zoom: INITIAL_ZOOM });
+                              return;
+                            }
+
+                            airportMap.addSource("airport-routes", {
+                              type: "geojson",
+                              data: geoJsonData
+                            });
+
+                            airportMap.addLayer({
+                              id: "airport-routes-line",
+                              type: "line",
+                              source: "airport-routes",
+                              layout: {
+                                "line-join": "round",
+                                "line-cap": "round"
+                              },
+                              paint: {
+                                "line-color": "#2563eb",
+                                "line-width": 1.5,
+                                "line-opacity": 0.7
+                              }
+                            });
+
+                            const bounds = new mapboxgl.LngLatBounds();
+                            (geoJsonData.features || []).forEach(function (f) {
+                              const geom = f.geometry || {};
+                              if (geom.type === "LineString" && Array.isArray(geom.coordinates)) {
+                                geom.coordinates.forEach(function (coord) {
+                                  if (Array.isArray(coord) && coord.length >= 2) {
+                                    bounds.extend(coord);
+                                  }
+                                });
+                              }
+                            });
+
+                            if (!bounds.isEmpty()) {
+                              airportMap.fitBounds(bounds, {
+                                padding: 40,
+                                maxZoom: 5
+                              });
+                            } else {
+                              airportMap.flyTo({ center: INITIAL_CENTER, zoom: INITIAL_ZOOM });
+                            }
+                          }
+
+                          function buildAirportFlowsFromGeojson(homeCode, geo) {
+                            airportFlowsByAirline = {};
+                            airportLastGeoJsonByAirline = {};
+                            airportLastGeoJsonAllAirlines = geo;
+
+                            if (!geo || !Array.isArray(geo.features)) {
+                              clearAirportMapRoutes();
+                              return;
+                            }
+
+                            const home = (homeCode || "").toUpperCase();
+                            const arrivalsAgg = new Map();
+                            const departuresAgg = new Map();
+
+                            geo.features.forEach(function (f) {
+                              const props = f.properties || {};
+                              const src = (props.src_iata || "").toUpperCase();
+                              const dst = (props.dst_iata || "").toUpperCase();
+                              const airline = (props.airline_code || "").toUpperCase();
+                              if (!airline) return;
+
+                              const coords = (f.geometry && f.geometry.coordinates) || [];
+                              if (!Array.isArray(coords) || coords.length < 2) return;
+                              const srcCoord = coords[0];
+                              const dstCoord = coords[1];
+
+                              var direction = null;
+                              var otherCode = null;
+                              var otherCoord = null;
+
+                              if (src === home && dst !== home) {
+                                direction = "departures";
+                                otherCode = dst;
+                                otherCoord = dstCoord;
+                              } else if (dst === home && src !== home) {
+                                direction = "arrivals";
+                                otherCode = src;
+                                otherCoord = srcCoord;
+                              } else {
+                                return;
+                              }
+
+                              if (!airportFlowsByAirline[airline]) {
+                                airportFlowsByAirline[airline] = { arrivals: [], departures: [] };
+                              }
+                              const flows = airportFlowsByAirline[airline];
+                              const destObj = {
+                                code: otherCode,
+                                latitude: Array.isArray(otherCoord) ? otherCoord[1] : undefined,
+                                longitude: Array.isArray(otherCoord) ? otherCoord[0] : undefined
+                              };
+                              flows[direction].push(destObj);
+
+                              const aggMap = direction === "arrivals" ? arrivalsAgg : departuresAgg;
+                              let agg = aggMap.get(otherCode);
+                              if (!agg) {
+                                agg = {
+                                  code: otherCode,
+                                  latitude: destObj.latitude,
+                                  longitude: destObj.longitude,
+                                  airlineCodes: new Set()
+                                };
+                                aggMap.set(otherCode, agg);
+                              }
+                              agg.airlineCodes.add(airline);
+                            });
+                            // We don't actually need the aggregated arrays for UI right now,
+                            // but they are easy to derive from arrivalsAgg / departuresAgg if desired.
+                          }
+
+                          function getGeoJsonForAirportAirline(airlineCode) {
+                            const code = (airlineCode || "").toUpperCase();
+                            if (!code || !airportLastGeoJsonAllAirlines) return null;
+                            if (airportLastGeoJsonByAirline[code]) {
+                              return airportLastGeoJsonByAirline[code];
+                            }
+                            const features = (airportLastGeoJsonAllAirlines.features || []).filter(function (f) {
+                              const props = f.properties || {};
+                              return (props.airline_code || "").toUpperCase() === code;
+                            });
+                            const geo = { type: "FeatureCollection", features: features };
+                            airportLastGeoJsonByAirline[code] = geo;
+                            return geo;
+                          }
+
+                          function loadAirportGeoJson(homeCode) {
+                            const code = (homeCode || "").toUpperCase();
+                            if (!code) return;
+                            airportLastGeoJsonAllAirlines = null;
+                            airportLastGeoJsonByAirline = {};
+                            selectedAirportAirlineCode = null;
+                            clearAirportMapRoutes();
+
+                            fetch("/api/airport/routes/geojson?airport=" + encodeURIComponent(code))
+                              .then(function (resp) {
+                                if (!resp.ok) {
+                                  return resp.text().then(function (t) {
+                                    throw new Error("GeoJSON error " + resp.status + ": " + t);
+                                  });
+                                }
+                                return resp.json();
+                              })
+                              .then(function (geo) {
+                                buildAirportFlowsFromGeojson(code, geo);
+                                renderAirportMapRoutes(geo);
+                              })
+                              .catch(function (err) {
+                                console.error("Failed to load airport GeoJSON", err);
+                                clearAirportMapRoutes();
+                              });
+                          }
+
+                          function populateAirlineDetailsForAirport(homeAirportCode, airlineCode, detailsEl) {
+                            if (!detailsEl) return;
+                            detailsEl.innerHTML = "";
+
+                            const code = (airlineCode || "").toUpperCase();
+                            const flows = airportFlowsByAirline[code];
+
+                            if (!flows ||
+                                ((!flows.arrivals || !flows.arrivals.length) &&
+                                 (!flows.departures || !flows.departures.length))) {
+                              const empty = document.createElement("div");
+                              empty.className = "airline-details-empty";
+                              empty.textContent = "No per-destination data available for this airline at this airport.";
+                              detailsEl.appendChild(empty);
+                              return;
+                            }
+
+                            function renderSection(title, items) {
+                              if (!items || !items.length) return;
+                              const sec = document.createElement("div");
+                              sec.className = "airport-flow-section";
+
+                              const titleEl = document.createElement("div");
+                              titleEl.className = "airport-flow-title";
+                              titleEl.textContent = title;
+                              sec.appendChild(titleEl);
+
+                              const grid = document.createElement("div");
+                              grid.className = "flows-grid";
+
+                              items.forEach(function (item) {
+                                if (!item) return;
+                                const label = item.code || "Unknown";
+                                const cell = document.createElement("div");
+                                cell.className = "flow-item";
+                                cell.textContent = label;
+                                grid.appendChild(cell);
+                              });
+
+                              sec.appendChild(grid);
+                              detailsEl.appendChild(sec);
+                            }
+
+                            renderSection("Arrivals (to " + homeAirportCode + ")", flows.arrivals);
+                            renderSection("Departures (from " + homeAirportCode + ")", flows.departures);
+                          }
+
+                          function setError(msg) {
+                            errorEl.textContent = msg || "";
+                          }
+
+                          function clearResults() {
+                            resultsList.innerHTML = "";
+                          }
+
+                          function updateViewTabs() {
+                            viewTabButtons.forEach(function (btn) {
+                              const mode = btn.getAttribute("data-mode");
+                              if (mode === viewMode) btn.classList.add("active");
+                              else btn.classList.remove("active");
+                            });
+                          }
+
+                          viewTabButtons.forEach(function (btn) {
+                            btn.addEventListener("click", function () {
+                              const mode = btn.getAttribute("data-mode");
+                              if (mode === viewMode) return;
+                              viewMode = mode;
+                              updateViewTabs();
+                              renderForCurrentMode();
+                            });
+                          });
+
+                          function getAirlineLogoUrl(code) {
+                            if (!code || code === "\\N") {
+                              return "https://placehold.co/40x40/f1f5f9/94a3b8?text=?";
+                            }
+                            return "https://images.kiwi.com/airlines/64/" + code.toUpperCase() + ".png";
+                          }
+
+                          function airlineDisplayName(al) {
+                            if (!al) return "Unknown airline";
+                            const code = al.iata || al.icao || al.code || "";
+                            const base = al.name || code || "Unknown airline";
+                            return code ? base + " (" + code + ")" : base;
+                          }
+
+                          function renderAirlinePillFromData(entry) {
+                            const al   = entry.airline || {};
+                            const code = al.iata || al.icao || al.code || "";
+                            const name = airlineDisplayName(al);
+                            const logoUrl = code ? getAirlineLogoUrl(code) : "";
+
+                            if (logoUrl) {
+                              return (
+                                '<span class="airline-pill">' +
+                                  '<img class="airline-pill-logo" src="' + logoUrl + '" alt="' + code + ' logo" />' +
+                                  '<span class="airline-pill-name">' + name + "</span>" +
+                                "</span>"
+                              );
+                            }
+
+                            const initial = (name || code || "?").charAt(0).toUpperCase();
+                            return (
+                              '<span class="airline-pill">' +
+                                '<span class="airline-pill-fallback">' + initial + "</span>" +
+                                '<span class="airline-pill-name">' + name + "</span>" +
+                              "</span>"
+                            );
+                          }
+
+                          function wireAirlineCardInteractions() {
+                            const homeCode = (currentAirportMeta && (currentAirportMeta.iata || currentAirportMeta.icao)) || "";
+                            const cards = document.querySelectorAll(".route-card.selectable");
+                            cards.forEach(function (card) {
+                              card.addEventListener("click", function () {
+                                const airlineCode = card.dataset.airlineCode || "";
+                                const already = card.classList.contains("selected");
+
+                                document.querySelectorAll(".route-card.selectable.selected").forEach(function (el) {
+                                  el.classList.remove("selected");
+                                  const d = el.querySelector(".airline-details");
+                                  if (d) {
+                                    d.style.display = "none";
+                                    d.innerHTML = "";
+                                  }
+                                });
+
+                                if (already) {
+                                  selectedAirportAirlineCode = null;
+                                  if (airportLastGeoJsonAllAirlines) {
+                                    renderAirportMapRoutes(airportLastGeoJsonAllAirlines);
+                                  }
+                                  return;
+                                }
+
+                                selectedAirportAirlineCode = airlineCode;
+                                card.classList.add("selected");
+                                const detailsEl = card.querySelector(".airline-details");
+                                if (detailsEl) {
+                                  populateAirlineDetailsForAirport(homeCode, airlineCode, detailsEl);
+                                  detailsEl.style.display = "block";
+                                }
+
+                                const filteredGeo = getGeoJsonForAirportAirline(airlineCode);
+                                if (filteredGeo && filteredGeo.features && filteredGeo.features.length) {
+                                  renderAirportMapRoutes(filteredGeo);
+                                } else if (airportLastGeoJsonAllAirlines) {
+                                  renderAirportMapRoutes(airportLastGeoJsonAllAirlines);
+                                }
+                              });
+                            });
+                          }
+
+                          function renderCards(data) {
+                            clearResults();
+
+                            if (!data || !data.airport) {
+                              resultsList.innerHTML =
+                                '<p class="no-results">No results to display yet.</p>';
+                              return;
+                            }
+
+                            const airport  = data.airport;
+                            const airlines = data.airlines || [];
+
+                            const homeCode = airport.iata || airport.icao || "";
+                            const locBits = [];
+                            if (airport.city)    locBits.push(airport.city);
+                            if (airport.country) locBits.push(airport.country);
+
+                            const summary = document.createElement("div");
+                            summary.className = "card";
+
+                            summary.innerHTML =
+                              '<div class="main-line">' +
+                                '<span class="name-text">' + (airport.name || "Unknown airport") + '</span>' +
+                                (homeCode ? '<span class="pill">' + homeCode + "</span>" : "") +
+                              "</div>" +
+                              '<div class="sub-line">' +
+                                (locBits.length ? "<span>" + locBits.join(", ") + "</span>" : "") +
+                                '<span>Total airlines in dataset: ' + lastTotalAirlines + "</span>" +
+                              "</div>";
+
+                            resultsList.appendChild(summary);
+
+                            // If no airlines, show message but KEEP the summary card
+                            if (!airlines.length) {
+                              const p = document.createElement("p");
+                              p.className = "no-results";
+                              p.textContent = "No airlines in the dataset for this airport.";
+                              resultsList.appendChild(p);
+                              return;   // nothing to wire up
+                            }
+
+                            // Otherwise, render airline cards as before
+                            airlines.forEach(function (entry) {
+                              const al          = entry.airline || {};
+                              const count       = entry.routes || 0;
+                              const country     = al.country || "";
+                              const airlineCode = (al.iata || al.icao || al.code || "").toUpperCase();
+                              const activeFlag  = (typeof al.active === "boolean") ? al.active : null;
+
+                              const card = document.createElement("div");
+                              card.className = "route-card selectable";
+                              if (airlineCode) {
+                                card.dataset.airlineCode = airlineCode;
+                              }
+
+                              const statusHtml = (activeFlag === true || activeFlag === false)
+                                ? '<span class="status-pill ' + (activeFlag ? 'active' : 'inactive') +
+                                  '">Active = ' + (activeFlag ? 'True' : 'False') + '</span>'
+                                : "";
+
+                              card.innerHTML =
+                                '<div class="route-main-line">' +
+                                  renderAirlinePillFromData(entry) +
+                                  '<div class="airline-summary-right">' +
+                                    '<span class="route-tag">' + count + ' route' + (count === 1 ? "" : "s") + "</span>" +
+                                    statusHtml +
+                                  '</div>' +
+                                "</div>" +
+                                '<div class="route-sub-line">' +
+                                  (country ? "<span>Country: " + country + "</span>" : "") +
+                                "</div>" +
+                                '<div class="airline-details"></div>';
+
+                              resultsList.appendChild(card);
+                            });
+
+                            // ✅ still wire up click/hover behavior
+                            wireAirlineCardInteractions();
+                          }
+
+                          function renderJson() {
+                            clearResults();
+
+                            if (!lastData) {
+                              resultsList.innerHTML =
+                                '<p class="no-results">(run a search to see JSON)</p>';
+                              return;
+                            }
+
+                            const jsonStr = JSON
+                              .stringify(lastData, null, 2)
+                              .replace(/</g, "&lt;");
+
+                            resultsList.innerHTML =
+                              '<pre style="background:#020617;color:#e5e7eb;' +
+                              'padding:0.75rem;border-radius:0.5rem;font-size:0.8rem;' +
+                              'overflow:auto;max-height:24rem;">' +
+                              jsonStr +
+                              "</pre>";
+                          }
+
+                          function renderForCurrentMode() {
+                            if (viewMode === "json") renderJson();
+                            else renderCards(lastData);
+                          }
+
+                          form.addEventListener("submit", function (e) {
+                            e.preventDefault();
+                            setError("");
+
+                            var code = (airportInput.value || "").trim().toUpperCase();
+                            if (!code) {
+                              setError("Please enter an airport code (e.g. SJC, JFK, ATL).");
+                              return;
+                            }
+
+                            var parts = code.split(/\s+/);
+                            if (parts.length > 1) {
+                              code = parts[0];
+                            }
+
+                            var limit = parseInt((limitInput.value || "").trim(), 10);
+                            if (isNaN(limit) || limit <= 0) {
+                              limit = 50;
+                              limitInput.value = "50";
+                            }
+
+                            clearResults();
+                            resultsList.innerHTML =
+                              '<p class="no-results">Loading airport airlines…</p>';
+
+                            fetch("/airport/routes?code=" + encodeURIComponent(code))
+                              .then(function (resp) {
+                                if (!resp.ok) {
+                                  return resp.text().then(function (text) {
+                                    throw new Error("Server returned " + resp.status + ": " + text);
+                                  });
+                                }
+                                return resp.json();
+                              })
+                              .then(function (data) {
+                                if (data && typeof data === "object" && data.error) {
+                                  setError("Server error: " + data.error);
+                                  clearResults();
+                                  clearAirportMapRoutes();
+                                  return;
+                                }
+
+                                var airlinesArr = Array.isArray(data.airlines) ? data.airlines : [];
+                                lastTotalAirlines = airlinesArr.length;
+
+                                var limitedAirlines = airlinesArr;
+                                if (airlinesArr.length > limit) {
+                                  limitedAirlines = airlinesArr.slice(0, limit);
+                                }
+
+                                lastData = Object.assign({}, data, { airlines: limitedAirlines });
+                                currentAirportMeta = data.airport || null;
+                                currentAirportCode = code;
+
+                                // Load GeoJSON for this airport (all airlines) and update map + flows.
+                                loadAirportGeoJson(code);
+
+                                viewMode = "cards";
+                                updateViewTabs();
+                                renderCards(lastData);
+                              })
+                              .catch(function (err) {
+                                console.error(err);
+                                setError("Request failed. Please try again.");
+                                clearResults();
+                                clearAirportMapRoutes();
+                              });
+                          });
+                        })();
+                      </script>
+                    </body>
+                    </html>
+                    )HTML";
+                    response = buildHttpResponse(body, "text/html; charset=UTF-8");
+                }
+
         else if (pathOnly == "/airport") {
             // your existing /airport?code= handler:
             auto params = parseQueryString(queryString);
@@ -4773,24 +7386,37 @@ int main() {
                                              "HTTP/1.1 400 Bad Request\r\n");
             } else {
                 std::string code = it->second;
-                // Normalize to uppercase (IATA codes are uppercase in data)
+                // Normalize to uppercase
                 for (char &c : code) c = static_cast<char>(std::toupper((unsigned char)c));
-                
-                auto ait = g_airlinesByIata.find(code);
-                if (ait == g_airlinesByIata.end()) {
+
+                // ✅ NEW: use findAirlineByCode so this can be IATA *or* ICAO
+                const Airline *al = findAirlineByCode(code);
+
+                if (!al) {
                     std::ostringstream body;
                     body << R"({"error":"Airline with code ')" << code << R"(' not found"})";
                     response = buildHttpResponse(body.str(),
                                                  "application/json; charset=UTF-8",
                                                  "HTTP/1.1 404 Not Found\r\n");
                 } else {
-                    const Airline *al = ait->second;
                     std::string body = airlineRoutesReportToJson(*al);
                     response = buildHttpResponse(body,
                                                  "application/json; charset=UTF-8");
                 }
             }
         }
+        else if (pathOnly == "/airlines/search") {
+                    auto params = parseQueryString(queryString);
+                    auto itQ = params.find("q");
+                    std::string q = (itQ == params.end() ? "" : itQ->second);
+
+                    int limit = getIntQueryParam(params, "limit", 10);
+                    if (limit <= 0) limit = 10;
+
+                    std::string body = airlinesSearchToJson(q, limit);
+                    response = buildHttpResponse(body,
+                                                 "application/json; charset=UTF-8");
+                }
         else if (pathOnly == "/airports/search") {
             auto params = parseQueryString(queryString);
             auto itQ = params.find("q");
@@ -4803,6 +7429,88 @@ int main() {
             response = buildHttpResponse(body, "application/json; charset=UTF-8");
         }
         // ... (existing handlers before this)
+        
+        else if (pathOnly == "/api/airport/routes/geojson") {
+                    auto params = parseQueryString(queryString);
+
+                    auto itAirport = params.find("airport");
+                    if (itAirport == params.end() || itAirport->second.empty()) {
+                        std::string body = R"({"error":"Missing 'airport' query parameter"})";
+                        response = buildHttpResponse(body,
+                                                     "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else {
+                        std::string airportCode = itAirport->second;
+                        for (char &c : airportCode) {
+                            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        }
+
+                        std::string airlineCode;
+                        auto itAirline = params.find("airline");
+                        if (itAirline != params.end() && !itAirline->second.empty()) {
+                            airlineCode = itAirline->second;
+                            for (char &c : airlineCode) {
+                                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                            }
+                        }
+
+                        std::vector<const Route*> routes;
+
+                        if (airlineCode.empty()) {
+                            // All airlines, just filter by airport (either src or dst).
+                            auto itSrc = g_routesBySrcAirport.find(airportCode);
+                            if (itSrc != g_routesBySrcAirport.end()) {
+                                routes.insert(routes.end(), itSrc->second.begin(), itSrc->second.end());
+                            }
+                            auto itDst = g_routesByDstAirport.find(airportCode);
+                            if (itDst != g_routesByDstAirport.end()) {
+                                routes.insert(routes.end(), itDst->second.begin(), itDst->second.end());
+                            }
+                        } else {
+                            // Filter by airline AND airport.
+                            const Airline *al = findAirlineByCode(airlineCode);
+                            if (!al) {
+                                std::ostringstream body;
+                                body << R"({"error":"Airline with code ')" << airlineCode
+                                     << R"(' not found"})";
+                                response = buildHttpResponse(body.str(),
+                                                             "application/json; charset=UTF-8",
+                                                             "HTTP/1.1 404 Not Found\r\n");
+                                // early return from handler chain
+                                send(client_fd, response.c_str(), response.size(), 0);
+                                close(client_fd);
+                                continue;
+                            }
+
+                            std::vector<const Route*> allAirlineRoutes;
+                            if (al->id != -1) {
+                                auto itR = g_routesByAirlineId.find(al->id);
+                                if (itR != g_routesByAirlineId.end()) {
+                                    allAirlineRoutes = itR->second;
+                                }
+                            } else {
+                                for (const auto &r : g_routes) {
+                                    if (!r.airline.empty() &&
+                                        !isNullField(r.airline) &&
+                                        r.airline == airlineCode) {
+                                        allAirlineRoutes.push_back(&r);
+                                    }
+                                }
+                            }
+
+                            for (const Route *rPtr : allAirlineRoutes) {
+                                if (!rPtr) continue;
+                                if (rPtr->srcAirport == airportCode ||
+                                    rPtr->dstAirport == airportCode) {
+                                    routes.push_back(rPtr);
+                                }
+                            }
+                        }
+
+                        std::string body = routesToGeoJson(routes);
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                    }
+                }
         
         else if (pathOnly == "/api/routes/geojson") {
             auto params = parseQueryString(queryString);
@@ -4905,18 +7613,556 @@ int main() {
                                          statusLine
                                          );
         }
-        else {
-            std::string body =
-            "<html><body><h1>404 Not Found</h1><p>No handler for " + pathOnly +
-            "</p></body></html>";
-            response = buildHttpResponse(body,
-                                         "text/html; charset=UTF-8",
-                                         "HTTP/1.1 404 Not Found\r\n");
-        }
         
-        send(client_fd, response.c_str(), response.size(), 0);
-        close(client_fd);
-    }
+        else if (pathOnly == "/update") {
+            auto params = parseQueryString(queryString);
+            
+            auto getParam = [&](const std::string &key) -> std::string {
+                auto it = params.find(key);
+                if (it == params.end()) return "";
+                return it->second;
+            };
+            
+            std::string entity    = getParam("entity");
+            std::string operation = getParam("operation");
+            
+            // Normalize to lowercase
+            auto toLower = [](std::string s) {
+                for (char &c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+                return s;
+            };
+            entity    = toLower(entity);
+            operation = toLower(operation);
+            
+            if (entity.empty() || operation.empty()) {
+                std::string body = buildUpdateResponse(
+                                                       entity.empty() ? "" : entity,
+                                                       operation.empty() ? "" : operation,
+                                                       false,
+                                                       "",
+                                                       "",
+                                                       "Missing 'entity' or 'operation' parameter"
+                                                       );
+                response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                             "HTTP/1.1 400 Bad Request\r\n");
+            } else if (entity == "airport") {
+                // -------- Airport operations --------
+                std::string idStr = getParam("id");
+                int id = !idStr.empty() ? parseIntOr(idStr, -1) : -1;
+                
+                if (operation == "insert") {
+                    if (id == -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airport","insert",false,"","",
+                                                               "Insert airport requires a valid 'id' parameter");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else if (findAirportIndexById(id) != -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airport","insert",false,"","",
+                                                               "Airport ID already exists");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 409 Conflict\r\n");
+                    } else {
+                        Airport a;
+                        a.id            = id;
+                        a.name          = getParam("name");
+                        a.city          = getParam("city");
+                        a.country       = getParam("country");
+                        a.iata          = upperCopy(getParam("iata"));
+                        a.icao          = upperCopy(getParam("icao"));
+                        a.latitude      = parseDoubleOr(getParam("latitude"), 0.0);
+                        a.longitude     = parseDoubleOr(getParam("longitude"), 0.0);
+                        a.altitude      = parseIntOr(getParam("altitude"), 0);
+                        a.timezone      = parseDoubleOr(getParam("timezone"), 0.0);
+                        a.dst           = getParam("dst");
+                        a.tzdbTimezone  = getParam("tzdbTimezone");
+                        a.type          = getParam("type");
+                        a.source        = getParam("source");
+                        
+                        // Optional: ensure IATA uniqueness as well.
+                        if (!a.iata.empty() && g_airportsByIata.count(a.iata) > 0) {
+                            std::string body = buildUpdateResponse(
+                                                                   "airport","insert",false,"","",
+                                                                   "Another airport already uses this IATA code");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 409 Conflict\r\n");
+                        } else {
+                            g_airports.push_back(a);
+                            rebuildAirportIndex();
+                            
+                            std::string afterJson = airportToJson(g_airports.back());
+                            std::string body = buildUpdateResponse(
+                                                                   "airport","insert",true,"",afterJson,"");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                        }
+                    }
+                }
+                else if (operation == "modify") {
+                    if (id == -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airport","modify",false,"","",
+                                                               "Modify airport requires 'id'");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else {
+                        int idx = findAirportIndexById(id);
+                        if (idx == -1) {
+                            std::string body = buildUpdateResponse(
+                                                                   "airport","modify",false,"","",
+                                                                   "Airport id not found");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 404 Not Found\r\n");
+                        } else {
+                            Airport before = g_airports[idx];
+                            Airport &a = g_airports[idx];
+                            
+                            // IATA uniqueness check if iata provided
+                            if (params.count("iata")) {
+                                std::string newIata = upperCopy(getParam("iata"));
+                                if (!newIata.empty()) {
+                                    for (std::size_t i = 0; i < g_airports.size(); ++i) {
+                                        if (i == static_cast<std::size_t>(idx)) continue;
+                                        if (g_airports[i].iata == newIata) {
+                                            std::string body = buildUpdateResponse(
+                                                                                   "airport","modify",false,
+                                                                                   airportToJson(before),
+                                                                                   "",
+                                                                                   "Another airport already uses this IATA code");
+                                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                                         "HTTP/1.1 409 Conflict\r\n");
+                                            goto airport_modify_done;
+                                        }
+                                    }
+                                }
+                                a.iata = newIata;
+                            }
+                            if (params.count("name"))         a.name         = getParam("name");
+                            if (params.count("city"))         a.city         = getParam("city");
+                            if (params.count("country"))      a.country      = getParam("country");
+                            if (params.count("icao"))         a.icao         = upperCopy(getParam("icao"));
+                            if (params.count("latitude"))     a.latitude     = parseDoubleOr(getParam("latitude"), a.latitude);
+                            if (params.count("longitude"))    a.longitude    = parseDoubleOr(getParam("longitude"), a.longitude);
+                            if (params.count("altitude"))     a.altitude     = parseIntOr(getParam("altitude"), a.altitude);
+                            if (params.count("timezone"))     a.timezone     = parseDoubleOr(getParam("timezone"), a.timezone);
+                            if (params.count("dst"))          a.dst          = getParam("dst");
+                            if (params.count("tzdbTimezone")) a.tzdbTimezone = getParam("tzdbTimezone");
+                            if (params.count("type"))         a.type         = getParam("type");
+                            if (params.count("source"))       a.source       = getParam("source");
+                            
+                            rebuildAirportIndex();
+                            
+                            {
+                                std::string body = buildUpdateResponse(
+                                                                       "airport","modify",true,
+                                                                       airportToJson(before),
+                                                                       airportToJson(a),
+                                                                       "");
+                                response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                            }
+                            
+                        airport_modify_done:
+                            (void)0;
+                        }
+                    }
+                }
+                else if (operation == "remove") {
+                    const Airport *targetAp = nullptr;
+                    int idx = -1;
+                    
+                    if (id != -1) {
+                        idx = findAirportIndexById(id);
+                        if (idx != -1) targetAp = &g_airports[idx];
+                    } else if (params.count("iata")) {
+                        std::string code = upperCopy(getParam("iata"));
+                        targetAp = findAirportByIata(code);
+                        if (targetAp) {
+                            idx = findAirportIndexById(targetAp->id);
+                        }
+                    }
+                    
+                    if (!targetAp || idx == -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airport","remove",false,"","",
+                                                               "Airport not found for removal");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 404 Not Found\r\n");
+                    } else {
+                        Airport before = *targetAp;
+                        std::string code = before.iata;
+                        int airportId = before.id;
+                        
+                        // Remove airport
+                        g_airports.erase(g_airports.begin() + idx);
+                        rebuildAirportIndex();
+                        
+                        // Remove all routes touching this airport
+                        g_routes.erase(
+                                       std::remove_if(g_routes.begin(), g_routes.end(),
+                                                      [&](const Route &r) {
+                                                          if (r.srcAirportId == airportId ||
+                                                              r.dstAirportId == airportId) return true;
+                                                          if (!code.empty() &&
+                                                              (r.srcAirport == code || r.dstAirport == code)) return true;
+                                                          return false;
+                                                      }),
+                                       g_routes.end());
+                        rebuildRouteIndices();
+                        
+                        std::string body = buildUpdateResponse(
+                                                               "airport","remove",true,
+                                                               airportToJson(before),
+                                                               "", // after = null
+                                                               "");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                    }
+                }
+                else {
+                    std::string body = buildUpdateResponse(
+                                                           "airport", operation, false,"","",
+                                                           "Unsupported airport operation");
+                    response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                 "HTTP/1.1 400 Bad Request\r\n");
+                }
+            }
+            else if (entity == "airline") {
+                // -------- Airline operations --------
+                std::string idStr = getParam("id");
+                int id = !idStr.empty() ? parseIntOr(idStr, -1) : -1;
+                
+                if (operation == "insert") {
+                    if (id == -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airline","insert",false,"","",
+                                                               "Insert airline requires a valid 'id'");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else if (findAirlineIndexById(id) != -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airline","insert",false,"","",
+                                                               "Airline ID already exists");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 409 Conflict\r\n");
+                    } else {
+                        Airline al;
+                        al.id        = id;
+                        al.name      = getParam("name");
+                        al.alias     = getParam("alias");
+                        al.iata      = upperCopy(getParam("iata"));
+                        al.icao      = upperCopy(getParam("icao"));
+                        al.callsign  = getParam("callsign");
+                        al.country   = getParam("country");
+                        std::string activeStr = toLower(getParam("active"));
+                        al.active    = (!activeStr.empty() &&
+                                        (activeStr == "true" || activeStr == "y" || activeStr == "yes"));
+                        
+                        if (!al.iata.empty() && g_airlinesByIata.count(al.iata) > 0) {
+                            std::string body = buildUpdateResponse(
+                                                                   "airline","insert",false,"","",
+                                                                   "Another airline already uses this IATA code");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 409 Conflict\r\n");
+                        } else {
+                            g_airlines.push_back(al);
+                            rebuildAirlineIndex();
+                            
+                            std::string body = buildUpdateResponse(
+                                                                   "airline","insert",true,"",
+                                                                   airlineToJson(g_airlines.back()),
+                                                                   "");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                        }
+                    }
+                }
+                else if (operation == "modify") {
+                    if (id == -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airline","modify",false,"","",
+                                                               "Modify airline requires 'id'");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else {
+                        int idx = findAirlineIndexById(id);
+                        if (idx == -1) {
+                            std::string body = buildUpdateResponse(
+                                                                   "airline","modify",false,"","",
+                                                                   "Airline id not found");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 404 Not Found\r\n");
+                        } else {
+                            Airline before = g_airlines[idx];
+                            Airline &al = g_airlines[idx];
+                            
+                            if (params.count("iata")) {
+                                std::string newIata = upperCopy(getParam("iata"));
+                                if (!newIata.empty()) {
+                                    for (std::size_t i = 0; i < g_airlines.size(); ++i) {
+                                        if (i == static_cast<std::size_t>(idx)) continue;
+                                        if (g_airlines[i].iata == newIata) {
+                                            std::string body = buildUpdateResponse(
+                                                                                   "airline","modify",false,
+                                                                                   airlineToJson(before),
+                                                                                   "",
+                                                                                   "Another airline already uses this IATA code");
+                                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                                         "HTTP/1.1 409 Conflict\r\n");
+                                            goto airline_modify_done;
+                                        }
+                                    }
+                                }
+                                al.iata = newIata;
+                            }
+                            
+                            if (params.count("name"))     al.name     = getParam("name");
+                            if (params.count("alias"))    al.alias    = getParam("alias");
+                            if (params.count("icao"))     al.icao     = upperCopy(getParam("icao"));
+                            if (params.count("callsign")) al.callsign = getParam("callsign");
+                            if (params.count("country"))  al.country  = getParam("country");
+                            if (params.count("active")) {
+                                std::string activeStr = toLower(getParam("active"));
+                                al.active = (!activeStr.empty() &&
+                                             (activeStr == "true" || activeStr == "y" || activeStr == "yes"));
+                            }
+                            
+                            rebuildAirlineIndex();
+                            
+                            {
+                                std::string body = buildUpdateResponse(
+                                                                       "airline","modify",true,
+                                                                       airlineToJson(before),
+                                                                       airlineToJson(al),
+                                                                       "");
+                                response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                            }
+                            
+                        airline_modify_done:
+                            (void)0;
+                        }
+                    }
+                }
+                else if (operation == "remove") {
+                    const Airline *targetAl = nullptr;
+                    int idx = -1;
+                    
+                    if (id != -1) {
+                        idx = findAirlineIndexById(id);
+                        if (idx != -1) targetAl = &g_airlines[idx];
+                    } else if (params.count("iata")) {
+                        std::string code = upperCopy(getParam("iata"));
+                        targetAl = findAirlineByCode(code);
+                        if (targetAl) {
+                            idx = findAirlineIndexById(targetAl->id);
+                        }
+                    }
+                    
+                    if (!targetAl || idx == -1) {
+                        std::string body = buildUpdateResponse(
+                                                               "airline","remove",false,"","",
+                                                               "Airline not found for removal");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 404 Not Found\r\n");
+                    } else {
+                        Airline before = *targetAl;
+                        int airlineId = before.id;
+                        std::string code = !before.iata.empty() ? before.iata : before.icao;
+                        
+                        // Remove airline
+                        g_airlines.erase(g_airlines.begin() + idx);
+                        rebuildAirlineIndex();
+                        
+                        // Remove all routes for this airline
+                        g_routes.erase(
+                                       std::remove_if(g_routes.begin(), g_routes.end(),
+                                                      [&](const Route &r) {
+                                                          if (r.airlineId == airlineId) return true;
+                                                          if (!code.empty() && r.airline == code) return true;
+                                                          return false;
+                                                      }),
+                                       g_routes.end());
+                        rebuildRouteIndices();
+                        
+                        std::string body = buildUpdateResponse(
+                                                               "airline","remove",true,
+                                                               airlineToJson(before),
+                                                               "",
+                                                               "");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                    }
+                }
+                else {
+                    std::string body = buildUpdateResponse(
+                                                           "airline",operation,false,"","",
+                                                           "Unsupported airline operation");
+                    response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                 "HTTP/1.1 400 Bad Request\r\n");
+                }
+            }
+            else if (entity == "route") {
+                // -------- Route operations --------
+                if (operation == "insert") {
+                    std::string airlineCode = upperCopy(getParam("airline"));
+                    std::string srcCode     = upperCopy(getParam("src"));
+                    std::string dstCode     = upperCopy(getParam("dst"));
+                    
+                    if (airlineCode.empty() || srcCode.empty() || dstCode.empty()) {
+                        std::string body = buildUpdateResponse(
+                                                               "route","insert",false,"","",
+                                                               "Insert route requires 'airline', 'src', and 'dst'");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else {
+                        const Airline *al = findAirlineByCode(airlineCode);
+                        const Airport *srcAp = findAirportByIata(srcCode);
+                        const Airport *dstAp = findAirportByIata(dstCode);
+                        
+                        if (!al) {
+                            std::string body = buildUpdateResponse(
+                                                                   "route","insert",false,"","",
+                                                                   "Airline not found");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 404 Not Found\r\n");
+                        } else if (!srcAp || !dstAp) {
+                            std::string body = buildUpdateResponse(
+                                                                   "route","insert",false,"","",
+                                                                   "Source and/or destination airport not found");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 404 Not Found\r\n");
+                        } else {
+                            Route r;
+                            r.airline      = airlineCode;
+                            r.airlineId    = al->id;
+                            r.srcAirport   = srcCode;
+                            r.srcAirportId = srcAp->id;
+                            r.dstAirport   = dstCode;
+                            r.dstAirportId = dstAp->id;
+                            
+                            std::string codeshareStr = toLower(getParam("codeshare"));
+                            r.codeshare = (!codeshareStr.empty() &&
+                                           (codeshareStr == "true" || codeshareStr == "y" || codeshareStr == "yes"));
+                            r.stops     = parseIntOr(getParam("stops"), 0);
+                            r.equipment = getParam("equipment");
+                            
+                            g_routes.push_back(r);
+                            rebuildRouteIndices();
+                            
+                            std::string body = buildUpdateResponse(
+                                                                   "route","insert",true,"",
+                                                                   routeToJson(g_routes.back()),
+                                                                   "");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                        }
+                    }
+                }
+                else if (operation == "modify") {
+                    std::string airlineCode = upperCopy(getParam("airline"));
+                    std::string srcCode     = upperCopy(getParam("src"));
+                    std::string dstCode     = upperCopy(getParam("dst"));
+                    
+                    if (airlineCode.empty() || srcCode.empty() || dstCode.empty()) {
+                        std::string body = buildUpdateResponse(
+                                                               "route","modify",false,"","",
+                                                               "Modify route requires 'airline', 'src', and 'dst' to identify the route");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else {
+                        int idx = findRouteIndexByTriple(airlineCode, srcCode, dstCode);
+                        if (idx == -1) {
+                            std::string body = buildUpdateResponse(
+                                                                   "route","modify",false,"","",
+                                                                   "Route (airline, src, dst) not found");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 404 Not Found\r\n");
+                        } else {
+                            Route before = g_routes[idx];
+                            Route &r = g_routes[idx];
+                            
+                            // We keep airline/src/dst fixed; allow mutating codeshare, stops, equipment.
+                            if (params.count("codeshare")) {
+                                std::string csStr = toLower(getParam("codeshare"));
+                                r.codeshare = (!csStr.empty() &&
+                                               (csStr == "true" || csStr == "y" || csStr == "yes"));
+                            }
+                            if (params.count("stops")) {
+                                r.stops = parseIntOr(getParam("stops"), r.stops);
+                            }
+                            if (params.count("equipment")) {
+                                r.equipment = getParam("equipment");
+                            }
+                            
+                            rebuildRouteIndices();
+                            
+                            std::string body = buildUpdateResponse(
+                                                                   "route","modify",true,
+                                                                   routeToJson(before),
+                                                                   routeToJson(r),
+                                                                   "");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                        }
+                    }
+                }
+                else if (operation == "remove") {
+                    std::string airlineCode = upperCopy(getParam("airline"));
+                    std::string srcCode     = upperCopy(getParam("src"));
+                    std::string dstCode     = upperCopy(getParam("dst"));
+                    
+                    if (airlineCode.empty() || srcCode.empty() || dstCode.empty()) {
+                        std::string body = buildUpdateResponse(
+                                                               "route","remove",false,"","",
+                                                               "Remove route requires 'airline', 'src', and 'dst'");
+                        response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                     "HTTP/1.1 400 Bad Request\r\n");
+                    } else {
+                        int idx = findRouteIndexByTriple(airlineCode, srcCode, dstCode);
+                        if (idx == -1) {
+                            std::string body = buildUpdateResponse(
+                                                                   "route","remove",false,"","",
+                                                                   "Route (airline, src, dst) not found");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                         "HTTP/1.1 404 Not Found\r\n");
+                        } else {
+                            Route before = g_routes[idx];
+                            g_routes.erase(g_routes.begin() + idx);
+                            rebuildRouteIndices();
+                            
+                            std::string body = buildUpdateResponse(
+                                                                   "route","remove",true,
+                                                                   routeToJson(before),
+                                                                   "",
+                                                                   "");
+                            response = buildHttpResponse(body, "application/json; charset=UTF-8");
+                        }
+                    }
+                }
+                else {
+                    std::string body = buildUpdateResponse(
+                                                           "route",operation,false,"","",
+                                                           "Unsupported route operation");
+                    response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                                 "HTTP/1.1 400 Bad Request\r\n");
+                }
+            }
+            else {
+                std::string body = buildUpdateResponse(
+                                                       entity,operation,false,"","",
+                                                       "Unsupported entity type");
+                response = buildHttpResponse(body, "application/json; charset=UTF-8",
+                                             "HTTP/1.1 400 Bad Request\r\n");
+            }
+        }
+                else {
+                            std::string body =
+                                "<html><body><h1>404 Not Found</h1><p>No handler for " + pathOnly +
+                                "</p></body></html>";
+                            response = buildHttpResponse(body,
+                                                         "text/html; charset=UTF-8",
+                                                         "HTTP/1.1 404 Not Found\r\n");
+                        }
+
+                        // ✅ send response ONCE, after all branches (including /update)
+                        send(client_fd, response.c_str(), response.size(), 0);
+                        close(client_fd);
+                    }  // end "if (client_fd >= 0)" block
+
     
     
     close(server_fd);

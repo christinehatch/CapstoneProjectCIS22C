@@ -1,2 +1,11 @@
 .DS_Store
 node_modules/
+
+# Xcode UI state
+*.xcuserstate
+
+# Playwright test output
+test-results/
+
+# Xcode UI state
+*.xcuserstate

@@ -1,0 +1,946 @@
+
+<!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8" />
+          <title>Update OpenFlights Data</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <style>
+            body {
+              font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+              margin: 0;
+              padding: 1.5rem;
+              background: #f5f5f5;
+              color: #222;
+            }
+            .container {
+              max-width: 880px;
+              margin: 0 auto;
+              background: #ffffff;
+              border-radius: 12px;
+              padding: 1.5rem 1.75rem 1.75rem;
+              box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            }
+            .header-bar {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              gap: 1rem;
+              margin-bottom: 0.75rem;
+            }
+            .header-left h1 {
+              margin: 0;
+              font-size: 1.7rem;
+            }
+            .subtitle {
+              font-size: 0.85rem;
+              color: #6b7280;
+              margin-top: 0.15rem;
+            }
+            .header-right a {
+              font-size: 0.8rem;
+              text-decoration: none;
+              padding: 0.35rem 0.65rem;
+              border-radius: 999px;
+              border: 1px solid #e5e7eb;
+              color: #374151;
+              background: #f9fafb;
+            }
+            .header-right a:hover {
+              background: #e5e7eb;
+            }
+
+            form {
+              display: grid;
+              gap: 0.75rem;
+              margin-bottom: 1.25rem;
+            }
+            .field-group {
+              display: flex;
+              flex-wrap: wrap;
+              gap: 0.75rem;
+            }
+            .field {
+              display: flex;
+              flex-direction: column;
+              min-width: 140px;
+              flex: 1 1 0;
+            }
+            .field label {
+              font-size: 0.8rem;
+              font-weight: 600;
+              margin-bottom: 0.15rem;
+              color: #374151;
+            }
+            .field input,
+            .field select,
+            .field textarea {
+              border-radius: 8px;
+              border: 1px solid #d1d5db;
+              padding: 0.45rem 0.55rem;
+              font-size: 0.9rem;
+            }
+
+            .btn {
+              border-radius: 999px;
+              padding: 0.45rem 1.1rem;
+              font-size: 0.9rem;
+              border: none;
+              cursor: pointer;
+              font-weight: 600;
+            }
+            .btn-primary {
+              background: #2563eb;
+              color: #f9fafb;
+            }
+            .btn-primary:hover {
+              background: #1d4ed8;
+            }
+
+            .badge {
+              display: inline-flex;
+              align-items: center;
+              padding: 0.2rem 0.6rem;
+              border-radius: 999px;
+              font-size: 0.75rem;
+              font-weight: 600;
+              background: #e5e7eb;
+              color: #374151;
+            }
+            .badge-entity {
+              background: #eef2ff;
+              color: #312e81;
+            }
+            .badge-op {
+              background: #eff6ff;
+              color: #1d4ed8;
+              margin-left: 0.35rem;
+            }
+
+            .hint {
+              font-size: 0.8rem;
+              color: #6b7280;
+            }
+
+            #error {
+              margin-top: 0.25rem;
+              font-size: 0.85rem;
+              color: #b91c1c;
+            }
+
+            .results-list {
+              display: grid;
+              gap: 0.75rem;
+            }
+            .card {
+              border-radius: 10px;
+              border: 1px solid #e5e7eb;
+              padding: 0.9rem 1rem;
+              background: #f9fafb;
+            }
+            .card-header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 0.35rem;
+            }
+            .card-title {
+              font-size: 0.95rem;
+              font-weight: 600;
+              color: #111827;
+            }
+            .card-body {
+              font-size: 0.85rem;
+              color: #374151;
+            }
+            .card-body dl {
+              display: grid;
+              grid-template-columns: minmax(0, 120px) minmax(0, 1fr);
+              row-gap: 0.15rem;
+              column-gap: 0.75rem;
+              margin: 0;
+            }
+            .card-body dt {
+              font-weight: 600;
+              color: #6b7280;
+            }
+            .card-body dd {
+              margin: 0;
+              word-break: break-word;
+            }
+
+            .card-success {
+              border-color: #bbf7d0;
+              background: #ecfdf3;
+            }
+            .card-error {
+              border-color: #fecaca;
+              background: #fef2f2;
+              color: #b91c1c;
+            }
+            .muted {
+              color: #6b7280;
+            }
+
+            .section-label {
+              font-size: 0.8rem;
+              font-weight: 600;
+              text-transform: uppercase;
+              letter-spacing: 0.06em;
+              color: #9ca3af;
+              margin-bottom: 0.35rem;
+            }
+
+            .checkbox-row {
+              display: flex;
+              align-items: center;
+              gap: 0.35rem;
+              margin-top: 0.15rem;
+            }
+            .checkbox-row label {
+              margin: 0;
+              font-size: 0.8rem;
+              font-weight: 500;
+            }
+
+            /* Autocomplete */
+            .autocomplete-container {
+              position: relative;
+            }
+            .autocomplete-list {
+              position: absolute;
+              top: 100%;
+              left: 0;
+              right: 0;
+              z-index: 20;
+              max-height: 14rem;
+              overflow-y: auto;
+              margin-top: 0.25rem;
+              background: #ffffff;
+              border-radius: 0.5rem;
+              border: 1px solid #e5e7eb;
+              box-shadow: 0 10px 25px rgba(15,23,42,0.15);
+              display: none;
+            }
+            .autocomplete-item {
+              padding: 0.4rem 0.6rem;
+              font-size: 0.9rem;
+              cursor: pointer;
+            }
+            .autocomplete-item:hover,
+            .autocomplete-item.active {
+              background: #f3f4f6;
+            }
+            .autocomplete-empty {
+              padding: 0.4rem 0.6rem;
+              font-size: 0.85rem;
+              color: #6b7280;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header-bar">
+              <div class="header-left">
+                <h1>Update OpenFlights Data</h1>
+                <p class="subtitle">
+                  Insert, modify, or remove Airports, Airlines, and Routes. Changes are in-memory only
+                  and immediately affect the /airport-ui, /airline-ui, and JSON APIs.
+                </p>
+              </div>
+              <div class="header-right">
+                <a href="/">← Back to Route Finder</a>
+              </div>
+            </div>
+
+            <form id="update-form">
+              <div class="field-group">
+                <div class="field" style="max-width: 220px;">
+                  <label for="entity">Entity Type</label>
+                  <select id="entity" name="entity">
+                    <option value="airport">Airport</option>
+                    <option value="airline">Airline</option>
+                    <option value="route">Route</option>
+                  </select>
+                </div>
+                <div class="field" style="max-width: 220px;">
+                  <label for="operation">Operation</label>
+                  <select id="operation" name="operation">
+                    <option value="insert">Insert</option>
+                    <option value="modify">Modify</option>
+                    <option value="remove">Remove</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="section-label">Fields</div>
+              <div id="dynamicFields"></div>
+
+              <button type="submit" class="btn btn-primary">
+                Apply Update
+              </button>
+              <div id="error"></div>
+              <div class="hint">
+                This calls the <code>/update</code> JSON API:
+                <code>/update?entity=airport&amp;operation=modify&amp;…</code>
+              </div>
+            </form>
+
+            <div class="section-label">Result</div>
+            <div id="updateResults" class="results-list">
+              <div class="card muted">
+                <div class="card-header">
+                  <span class="card-title">No updates yet</span>
+                </div>
+                <div class="card-body">
+                  Submit an update to see the <strong>Before</strong> and <strong>After</strong> cards here.
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <script>
+            (function () {
+              const form         = document.getElementById("update-form");
+              const entitySelect = document.getElementById("entity");
+              const opSelect     = document.getElementById("operation");
+              const fieldsRoot   = document.getElementById("dynamicFields");
+              const errorEl      = document.getElementById("error");
+              const resultsRoot  = document.getElementById("updateResults");
+
+              let activeList = null;
+              let activeIndex = -1;
+
+              // Safety check: if these are null, nothing else will work
+              if (!form || !entitySelect || !opSelect || !fieldsRoot || !resultsRoot) {
+                console.error("Update UI: one or more required elements not found");
+                return;
+              }
+
+              function renderFields() {
+                const entity = entitySelect.value;
+                console.log("renderFields called for entity:", entity); // DEBUG
+                let html = "";
+
+                if (entity === "airport") {
+                  html += `
+                    <div class="field-group">
+                      <div class="field autocomplete-container">
+                        <label>Search Airport (name or IATA)</label>
+                        <input id="searchAirportInput" type="text"
+                               placeholder="Start typing an airport…" autocomplete="off" />
+                        <div id="searchAirportList" class="autocomplete-list"></div>
+                        <div class="hint">
+                          Select an airport to auto-fill ID and details (handy for modify/remove).
+                        </div>
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field" style="max-width:150px;">
+                        <label>Airport ID (required for modify/remove)</label>
+                        <input name="id" type="number" placeholder="e.g. 3364" />
+                      </div>
+                      <div class="field" style="max-width:150px;">
+                        <label>IATA code</label>
+                        <input name="iata" maxlength="3" placeholder="e.g. SJC" />
+                      </div>
+                      <div class="field">
+                        <label>Name</label>
+                        <input name="name" placeholder="e.g. San Jose International" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>City</label>
+                        <input name="city" placeholder="e.g. San Jose" />
+                      </div>
+                      <div class="field">
+                        <label>Country</label>
+                        <input name="country" placeholder="e.g. United States" />
+                      </div>
+                      <div class="field">
+                        <label>ICAO</label>
+                        <input name="icao" maxlength="4" placeholder="e.g. KSJC" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Latitude</label>
+                        <input name="latitude" type="text" placeholder="e.g. 37.3626" />
+                      </div>
+                      <div class="field">
+                        <label>Longitude</label>
+                        <input name="longitude" type="text" placeholder="-121.9290" />
+                      </div>
+                      <div class="field">
+                        <label>Altitude (ft)</label>
+                        <input name="altitude" type="number" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Timezone offset</label>
+                        <input name="timezone" type="text" placeholder="-8" />
+                      </div>
+                      <div class="field">
+                        <label>DST</label>
+                        <input name="dst" maxlength="2" placeholder="e.g. U" />
+                      </div>
+                      <div class="field">
+                        <label>TZDB timezone</label>
+                        <input name="tzdbTimezone" placeholder="e.g. America/Los_Angeles" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Type</label>
+                        <input name="type" placeholder="airport / station / port" />
+                      </div>
+                      <div class="field">
+                        <label>Source</label>
+                        <input name="source" placeholder="e.g. OurAirports" />
+                      </div>
+                    </div>
+                  `;
+                } else if (entity === "airline") {
+                  html += `
+                    <div class="field-group">
+                      <div class="field autocomplete-container">
+                        <label>Search Airline (name or code)</label>
+                        <input id="searchAirlineInput" type="text"
+                               placeholder="Start typing an airline…" autocomplete="off" />
+                        <div id="searchAirlineList" class="autocomplete-list"></div>
+                        <div class="hint">
+                          Select an airline to auto-fill ID and details (handy for modify/remove).
+                        </div>
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field" style="max-width:150px;">
+                        <label>Airline ID (required for modify/remove)</label>
+                        <input name="id" type="number" placeholder="e.g. 5209" />
+                      </div>
+                      <div class="field" style="max-width:150px;">
+                        <label>IATA code</label>
+                        <input name="iata" maxlength="3" placeholder="e.g. AA" />
+                      </div>
+                      <div class="field">
+                        <label>Name</label>
+                        <input name="name" placeholder="e.g. American Airlines" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Alias</label>
+                        <input name="alias" />
+                      </div>
+                      <div class="field">
+                        <label>ICAO</label>
+                        <input name="icao" maxlength="4" placeholder="e.g. AAL" />
+                      </div>
+                      <div class="field">
+                        <label>Callsign</label>
+                        <input name="callsign" placeholder="e.g. AMERICAN" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Country</label>
+                        <input name="country" placeholder="e.g. United States" />
+                      </div>
+                      <div class="field">
+                        <label>Active</label>
+                        <select name="active">
+                          <option value="">(leave unchanged)</option>
+                          <option value="true">Active (Y)</option>
+                          <option value="false">Inactive (N)</option>
+                        </select>
+                      </div>
+                    </div>
+                  `;
+                } else if (entity === "route") {
+                  html += `
+                    <div class="field-group">
+                      <div class="field" style="max-width:150px;">
+                        <label>Airline code (IATA/ICAO)</label>
+                        <input name="airline" maxlength="3" placeholder="e.g. UA" />
+                      </div>
+                      <div class="field" style="max-width:150px%;">
+                        <label>Source airport (IATA)</label>
+                        <input name="src" maxlength="3" placeholder="e.g. SFO" />
+                      </div>
+                      <div class="field" style="max-width:150px;">
+                        <label>Destination airport (IATA)</label>
+                        <input name="dst" maxlength="3" placeholder="e.g. JFK" />
+                      </div>
+                    </div>
+                    <div class="field-group">
+                      <div class="field">
+                        <label>Stops</label>
+                        <input name="stops" type="number" placeholder="0" />
+                      </div>
+                      <div class="field">
+                        <label>Equipment</label>
+                        <input name="equipment" placeholder="e.g. 738 739" />
+                      </div>
+                      <div class="field">
+                        <label>Codeshare</label>
+                        <div class="checkbox-row">
+                          <input id="codeshareChk" name="codeshare" type="checkbox" />
+                          <label for="codeshareChk">Codeshare (Y)</label>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="hint">
+                      For <strong>modify</strong> and <strong>remove</strong>, the combination
+                      (airline, src, dst) identifies the route. Modify currently lets you
+                      update stops, equipment, and codeshare.
+                    </div>
+                  `;
+                }
+
+                fieldsRoot.innerHTML = html;
+                setupEntitySpecificBehaviour();
+              }
+
+              function clearResults() {
+                resultsRoot.innerHTML = `
+                  <div class="card muted">
+                    <div class="card-header">
+                      <span class="card-title">No updates yet</span>
+                    </div>
+                    <div class="card-body">
+                      Submit an update to see the <strong>Before</strong> and <strong>After</strong> cards here.
+                    </div>
+                  </div>
+                `;
+              }
+
+              function renderEntitySummary(entity, obj) {
+                if (!obj) return "<p class=\"muted\">(no data)</p>";
+
+                function row(label, value) {
+                  if (value === undefined || value === null || value === "") return "";
+                  return `<dt>${label}</dt><dd>${String(value)}</dd>`;
+                }
+
+                if (entity === "airport") {
+                  return `
+                    <dl>
+                      ${row("ID", obj.id)}
+                      ${row("IATA", obj.iata)}
+                      ${row("ICAO", obj.icao)}
+                      ${row("Name", obj.name)}
+                      ${row("City", obj.city)}
+                      ${row("Country", obj.country)}
+                      ${row("Latitude", obj.latitude)}
+                      ${row("Longitude", obj.longitude)}
+                      ${row("Altitude", obj.altitude)}
+                      ${row("Timezone", obj.timezone)}
+                      ${row("DST", obj.dst)}
+                      ${row("TZDB", obj.tzdbTimezone)}
+                      ${row("Type", obj.type)}
+                      ${row("Source", obj.source)}
+                    </dl>
+                  `;
+                } else if (entity === "airline") {
+                  return `
+                    <dl>
+                      ${row("ID", obj.id)}
+                      ${row("IATA", obj.iata)}
+                      ${row("ICAO", obj.icao)}
+                      ${row("Name", obj.name)}
+                      ${row("Alias", obj.alias)}
+                      ${row("Callsign", obj.callsign)}
+                      ${row("Country", obj.country)}
+                      ${row("Active", obj.active)}
+                    </dl>
+                  `;
+                } else if (entity === "route") {
+                  return `
+                    <dl>
+                      ${row("Airline", obj.airline)}
+                      ${row("Airline ID", obj.airlineId)}
+                      ${row("Source", obj.srcAirport)}
+                      ${row("Destination", obj.dstAirport)}
+                      ${row("Src ID", obj.srcAirportId)}
+                      ${row("Dst ID", obj.dstAirportId)}
+                      ${row("Stops", obj.stops)}
+                      ${row("Codeshare", obj.codeshare)}
+                      ${row("Equipment", obj.equipment)}
+                    </dl>
+                  `;
+                }
+                return `<pre>${JSON.stringify(obj, null, 2)}</pre>`;
+              }
+
+              function renderResultCards(data) {
+                const entity = data.entityType || entitySelect.value;
+                const op     = data.operation   || opSelect.value;
+
+                const before = data.before || null;
+                const after  = data.after  || null;
+
+                let html = "";
+
+                if (before) {
+                  html += `
+                    <div class="card">
+                      <div class="card-header">
+                        <span class="card-title">Before Update</span>
+                        <span>
+                          <span class="badge badge-entity">${entity}</span>
+                          <span class="badge badge-op">${op}</span>
+                        </span>
+                      </div>
+                      <div class="card-body">
+                        ${renderEntitySummary(entity, before)}
+                      </div>
+                    </div>
+                  `;
+                } else if (op === "insert") {
+                  html += `
+                    <div class="card muted">
+                      <div class="card-header">
+                        <span class="card-title">Before Update</span>
+                      </div>
+                      <div class="card-body">
+                        No previous entity (insert).
+                      </div>
+                    </div>
+                  `;
+                }
+
+                if (op === "remove") {
+                  html += `
+                    <div class="card card-success">
+                      <div class="card-header">
+                        <span class="card-title">After Update</span>
+                      </div>
+                      <div class="card-body">
+                        Entity successfully removed.
+                      </div>
+                    </div>
+                  `;
+                } else if (after) {
+                  html += `
+                    <div class="card card-success">
+                      <div class="card-header">
+                        <span class="card-title">After Update</span>
+                      </div>
+                      <div class="card-body">
+                        ${renderEntitySummary(entity, after)}
+                      </div>
+                    </div>
+                  `;
+                }
+
+                resultsRoot.innerHTML = html;
+              }
+
+              function setError(msg) {
+                errorEl.textContent = msg || "";
+              }
+
+              // ---------- Autocomplete helpers ----------
+
+              async function fetchSuggestions(kind, query) {
+                if (!query || query.length < 2) return [];
+                const base = kind === "airport" ? "/airports/search" : "/airlines/search";
+                try {
+                  const resp = await fetch(base + "?q=" + encodeURIComponent(query) + "&limit=8");
+                  if (!resp.ok) return [];
+                  return await resp.json();
+                } catch (e) {
+                  console.error("autocomplete fetch error", e);
+                  return [];
+                }
+              }
+
+              function renderSuggestions(kind, items, inputEl, listEl) {
+                listEl.innerHTML = "";
+                activeList = listEl;
+                activeIndex = -1;
+
+                if (!items.length) {
+                  listEl.innerHTML = '<div class="autocomplete-empty">No matches</div>';
+                  listEl.style.display = "block";
+                  return;
+                }
+
+                items.forEach((obj) => {
+                  const div = document.createElement("div");
+                  div.className = "autocomplete-item";
+                  const display = obj.display || obj.name || obj.code || "";
+                  div.textContent = display;
+                  div.dataset.code = obj.code || "";
+
+                  div.addEventListener("click", () => {
+                    inputEl.value = display;
+                    listEl.style.display = "none";
+                    listEl.innerHTML = "";
+                    const code = div.dataset.code;
+                    if (code) {
+                      if (kind === "airport") {
+                        loadAirportDetails(code);
+                      } else if (kind === "airline") {
+                        loadAirlineDetails(code);
+                      }
+                    }
+                  });
+
+                  listEl.appendChild(div);
+                });
+
+                listEl.style.display = "block";
+              }
+
+              async function handleAutocompleteInput(kind, inputEl, listEl) {
+                const query = (inputEl.value || "").trim();
+                if (query.length < 2) {
+                  listEl.style.display = "none";
+                  listEl.innerHTML = "";
+                  return;
+                }
+                const items = await fetchSuggestions(kind, query);
+                if ((inputEl.value || "").trim() === query) {
+                  renderSuggestions(kind, items, inputEl, listEl);
+                }
+              }
+
+              function handleAutocompleteKeydown(e, inputEl, listEl) {
+                if (listEl.style.display === "none") return;
+
+                const items = listEl.querySelectorAll(".autocomplete-item");
+                if (!items.length) return;
+
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  if (activeList !== listEl) {
+                    activeList = listEl;
+                    activeIndex = -1;
+                  }
+                  const dir = e.key === "ArrowDown" ? 1 : -1;
+                  activeIndex = (activeIndex + dir + items.length) % items.length;
+                  items.forEach(el => el.classList.remove("active"));
+                  items[activeIndex].classList.add("active");
+                  items[activeIndex].scrollIntoView({ block: "nearest" });
+                } else if (e.key === "Enter") {
+                  if (activeIndex >= 0) {
+                    e.preventDefault();
+                    items[activeIndex].click();
+                  }
+                } else if (e.key === "Escape") {
+                  listEl.style.display = "none";
+                }
+              }
+
+              async function loadAirportDetails(code) {
+                try {
+                  const resp = await fetch("/airport?code=" + encodeURIComponent(code));
+                  if (!resp.ok) {
+                    setError("Airport " + code + " not found");
+                    return;
+                  }
+                  const data = await resp.json();
+                  populateAirportForm(data);
+                  setError("");
+                } catch (e) {
+                  console.error(e);
+                  setError("Failed to load airport details");
+                }
+              }
+
+              async function loadAirlineDetails(code) {
+                try {
+                  const resp = await fetch("/airline?code=" + encodeURIComponent(code));
+                  if (!resp.ok) {
+                    setError("Airline " + code + " not found");
+                    return;
+                  }
+                  const data = await resp.json();
+                  populateAirlineForm(data);
+                  setError("");
+                } catch (e) {
+                  console.error(e);
+                  setError("Failed to load airline details");
+                }
+              }
+
+              function populateAirportForm(ap) {
+                const f = form.elements;
+                if (!f) return;
+
+                if (f.id)            f.id.value            = (ap.id != null ? ap.id : "");
+                if (f.iata)          f.iata.value          = ap.iata || "";
+                if (f.name)          f.name.value          = ap.name || "";
+                if (f.city)          f.city.value          = ap.city || "";
+                if (f.country)       f.country.value       = ap.country || "";
+                if (f.icao)          f.icao.value          = ap.icao || "";
+                if (f.latitude)      f.latitude.value      = (ap.latitude != null ? ap.latitude : "");
+                if (f.longitude)     f.longitude.value     = (ap.longitude != null ? ap.longitude : "");
+                if (f.altitude)      f.altitude.value      = (ap.altitude != null ? ap.altitude : "");
+                if (f.timezone)      f.timezone.value      = (ap.timezone != null ? ap.timezone : "");
+                if (f.dst)           f.dst.value           = ap.dst || "";
+                if (f.tzdbTimezone)  f.tzdbTimezone.value  = ap.tzdbTimezone || "";
+                if (f.type)          f.type.value          = ap.type || "";
+                if (f.source)        f.source.value        = ap.source || "";
+
+                if (opSelect.value === "insert" && f.id) {
+                  f.id.value = "";
+                }
+              }
+
+              function populateAirlineForm(al) {
+                const f = form.elements;
+                if (!f) return;
+
+                if (f.id)       f.id.value       = (al.id != null ? al.id : "");
+                if (f.iata)     f.iata.value     = al.iata || "";
+                if (f.name)     f.name.value     = al.name || "";
+                if (f.alias)    f.alias.value    = al.alias || "";
+                if (f.icao)     f.icao.value     = al.icao || "";
+                if (f.callsign) f.callsign.value = al.callsign || "";
+                if (f.country)  f.country.value  = al.country || "";
+                if (f.active)   f.active.value   = (al.active ? "true" : "false");
+
+                if (opSelect.value === "insert" && f.id) {
+                  f.id.value = "";
+                }
+              }
+
+              function setupEntitySpecificBehaviour() {
+                const entity = entitySelect.value;
+
+                if (entity === "airport") {
+                  const input = document.getElementById("searchAirportInput");
+                  const list  = document.getElementById("searchAirportList");
+                  if (input && list) {
+                    input.addEventListener("input", () => {
+                      handleAutocompleteInput("airport", input, list);
+                    });
+                    input.addEventListener("keydown", (e) => {
+                      handleAutocompleteKeydown(e, input, list);
+                    });
+                  }
+                } else if (entity === "airline") {
+                  const input = document.getElementById("searchAirlineInput");
+                  const list  = document.getElementById("searchAirlineList");
+                  if (input && list) {
+                    input.addEventListener("input", () => {
+                      handleAutocompleteInput("airline", input, list);
+                    });
+                    input.addEventListener("keydown", (e) => {
+                      handleAutocompleteKeydown(e, input, list);
+                    });
+                  }
+                }
+              }
+
+              // Hide autocomplete lists when clicking outside
+              document.addEventListener("click", (e) => {
+                if (!e.target.closest(".autocomplete-container")) {
+                  document.querySelectorAll(".autocomplete-list").forEach((el) => {
+                    el.style.display = "none";
+                  });
+                }
+              });
+
+              // ---------- Submit handler ----------
+              form.addEventListener("submit", function (e) {
+                e.preventDefault();
+                setError("");
+
+                const entity = entitySelect.value;
+                const op     = opSelect.value;
+
+                const params = new URLSearchParams();
+                params.set("entity", entity);
+                params.set("operation", op);
+
+                const inputs = fieldsRoot.querySelectorAll("input, select, textarea");
+                inputs.forEach(function (el) {
+                  const name = el.name;
+                  if (!name) return;
+
+                  if (el.type === "checkbox") {
+                    if (el.checked) {
+                      params.set(name, "true");
+                    }
+                    return;
+                  }
+
+                  const value = (el.value || "").trim();
+                  if (value !== "") {
+                    params.set(name, value);
+                  }
+                });
+
+                resultsRoot.innerHTML = `
+                  <div class="card muted">
+                    <div class="card-header">
+                      <span class="card-title">Applying update…</span>
+                    </div>
+                    <div class="card-body">
+                      Please wait while the server validates and applies your change.
+                    </div>
+                  </div>
+                `;
+
+                fetch("/update?" + params.toString())
+                  .then(function (resp) {
+                    if (!resp.ok) {
+                      return resp.text().then(function (text) {
+                        throw new Error("Server returned " + resp.status + ": " + text);
+                      });
+                    }
+                    return resp.json();
+                  })
+                  .then(function (data) {
+                    if (!data || typeof data !== "object") {
+                      throw new Error("Malformed response from /update");
+                    }
+                    if (!data.success) {
+                      setError(data.error || "Update failed.");
+                      resultsRoot.innerHTML = `
+                        <div class="card card-error">
+                          <div class="card-header">
+                            <span class="card-title">Update failed</span>
+                          </div>
+                          <div class="card-body">
+                            ${data.error ? data.error : "An unknown error occurred."}
+                          </div>
+                        </div>
+                      `;
+                    } else {
+                      setError("");
+                      renderResultCards(data);
+                    }
+                  })
+                  .catch(function (err) {
+                    console.error(err);
+                    setError("Request failed: " + err.message);
+                    resultsRoot.innerHTML = `
+                      <div class="card card-error">
+                        <div class="card-header">
+                          <span class="card-title">Request error</span>
+                        </div>
+                        <div class="card-body">
+                          ${err.message}
+                        </div>
+                      </div>
+                    `;
+                  });
+              });
+
+              // Wire up dropdown changes
+              entitySelect.addEventListener("change", renderFields);
+              opSelect.addEventListener("change", renderFields);
+
+              // Initial fields + result state
+              renderFields();
+              clearResults();
+            })();
+          </script>
+        </body>
+        </html>
